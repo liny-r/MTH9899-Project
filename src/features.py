@@ -1,0 +1,323 @@
+"""Feature engineering: intraday + daily features, normalization pipeline, and EDA helpers."""
+
+import numpy as np
+import pandas as pd
+
+from .utils import (
+    TS_WINDOW, TS_MIN_PERIODS,
+    zscore_time_series_per_id, winsorize_mad, zscore_cross_sectional,
+)
+from .data import load_day_pivoted, build_daily_prev, INTRADAY_DIR
+
+# Key intraday timestamps
+TIME_0945 = '09:45'
+TIME_1100 = '11:00'
+TIME_1200 = '12:00'
+TIME_1430 = '14:30'
+TIME_1530 = '15:30'
+
+# Features using ±5 MAD winsorization (return-like, symmetric)
+MAD_FEATURES = [
+    'OvernightReturn', 'FirstHourMomentum', 'LastHourMomentum', 'IntradayReversal',
+    'IntradayReturnSkew', 'VolatilityAdjustedReturn',
+    'ShortTermReversal', 'Momentum21d', 'DollarVolTrend',
+]
+# Features using 1st–99th percentile winsorization (ratio/volume, right-skewed)
+PCT_FEATURES = ['RealizedUpsideVol', 'VolumeSurprise', 'VolumeMorningAfternoonRatio']
+# Features with no winsorization (bounded by construction)
+NO_WINSOR_FEATURES = ['RetVolCorr']
+
+ALL_FEATURE_NAMES = MAD_FEATURES + PCT_FEATURES + NO_WINSOR_FEATURES
+
+
+def features_single_day(r, v, date_int):
+    """Compute raw intraday features from pivoted CumReturnResid / CumVolume DataFrames.
+
+    Args:
+        r: DataFrame of CumReturnResid, columns=time strings, index=Id
+        v: DataFrame of CumVolume, columns=time strings, index=Id
+        date_int: integer date (YYYYMMDD)
+
+    Returns DataFrame with columns: Date, Id, raw feature columns,
+        CumReturnResid_1530, CumVolume_* (for later use in vol-adjusted features).
+    """
+    out = pd.DataFrame(index=r.index)
+    out['Date'] = date_int
+    out['Id'] = out.index
+
+    # 1. Overnight return (gap/overnight sentiment)
+    if TIME_0945 in r.columns:
+        out['OvernightReturn'] = r[TIME_0945].values
+
+    # 2. First-hour momentum (09:45 → 11:00; fall back to 09:45 → 12:00)
+    if TIME_0945 in r.columns:
+        if TIME_1100 in r.columns:
+            out['FirstHourMomentum'] = (r[TIME_1100] - r[TIME_0945]).values
+        elif TIME_1200 in r.columns:
+            out['FirstHourMomentum'] = (r[TIME_1200] - r[TIME_0945]).values
+
+    # 3. Last-hour momentum (14:30 → 15:30)
+    if TIME_1430 in r.columns and TIME_1530 in r.columns:
+        out['LastHourMomentum'] = (r[TIME_1530] - r[TIME_1430]).values
+
+    # CumReturnResid at 15:30 (used to compute VolatilityAdjustedReturn after daily merge)
+    if TIME_1530 in r.columns:
+        out['CumReturnResid_1530'] = r[TIME_1530].values
+
+    # 4. Intraday reversal (morning return − afternoon return)
+    if all(t in r.columns for t in [TIME_0945, TIME_1200, TIME_1530]):
+        morning = r[TIME_1200] - r[TIME_0945]
+        afternoon = r[TIME_1530] - r[TIME_1200]
+        out['IntradayReversal'] = (morning - afternoon).values
+
+    # 5–7. 15-min increments 09:45→15:30: skew, upside realized vol, return-vol correlation
+    times_ordered = sorted(
+        [c for c in r.columns if TIME_0945 <= c <= TIME_1530],
+        key=lambda t: (int(t[:2]), int(t[3:5])),
+    )
+    ret_inc = None
+    if len(times_ordered) >= 2:
+        ret_inc = r[times_ordered].diff(axis=1).iloc[:, 1:]
+        out['IntradayReturnSkew'] = ret_inc.skew(axis=1).values
+        arr = ret_inc.to_numpy(dtype=float)
+        up_sq = np.where(arr > 0, arr * arr, np.nan)
+        with np.errstate(all='ignore'):
+            out['RealizedUpsideVol'] = np.sqrt(np.nanmean(up_sq, axis=1))
+
+    # Volume snapshot columns (MDV_63 scaling applied later after daily merge)
+    if v is not None:
+        v_a = v.reindex(r.index)
+        for t, col in [(TIME_0945, 'CumVolume_0945'), (TIME_1200, 'CumVolume_1200'),
+                       (TIME_1530, 'CumVolume_1530')]:
+            if t in v.columns:
+                out[col] = v_a[t].values
+
+    # Return–volume correlation (corr of 15-min return increments with volume increments)
+    if ret_inc is not None and v is not None:
+        v_aligned = v.reindex(r.index)[times_ordered]
+        vol_inc = v_aligned.diff(axis=1).iloc[:, 1:]
+        out['RetVolCorr'] = ret_inc.corrwith(vol_inc, axis=1).values
+
+    return out.reset_index(drop=True)
+
+
+def build_intraday_features(date_strings, dev_dates, intraday_dir=INTRADAY_DIR):
+    """Loop over all dev dates and compute raw intraday features.
+
+    Args:
+        date_strings: sorted list of all date strings
+        dev_dates:    set/list of date ints to include
+        intraday_dir: path to intraday CSV directory
+
+    Returns concatenated DataFrame of raw intraday features.
+    """
+    dev_dates = set(dev_dates)
+    dfs = []
+    for date_str in date_strings:
+        date_int = int(date_str)
+        if date_int not in dev_dates:
+            continue
+        r, v = load_day_pivoted(date_str, intraday_dir)
+        if r is None:
+            continue
+        dfs.append(features_single_day(r, v, date_int))
+    return pd.concat(dfs, ignore_index=True)
+
+
+def build_daily_features(feat_df, daily_all, date_list, prev_date):
+    """Compute daily-only features requiring multiple lags of Close_adj / DollarVol.
+
+    Features computed (all use data from dates strictly before D):
+      - ShortTermReversal: Close_adj(t-1) / Close_adj(t-2) - 1
+      - Momentum21d:       Close_adj(t-2) / Close_adj(t-23) - 1  (skips t-1)
+      - DollarVolTrend:    mean(DollarVol, t-1..t-5) / MDV_63(t-1)
+
+    Returns feat_df with these three columns merged in.
+    """
+    rows = []
+    for D in feat_df['Date'].unique():
+        if D not in prev_date:
+            continue
+        D_prev = prev_date[D]
+        D_prev2 = prev_date.get(D_prev)
+        if D_prev2 is None:
+            continue
+        idx = date_list.index(D)
+        if idx < 23:
+            continue
+        D_prev23 = date_list[idx - 23]  # 21 trading days before D_prev (at idx-2)
+
+        d1 = (
+            daily_all[daily_all['Date'] == D_prev][['Id', 'Close_adj', 'DollarVol', 'MDV_63']]
+            .rename(columns={'Close_adj': 'c1', 'DollarVol': 'dv1', 'MDV_63': 'MDV_63_1'})
+        )
+        d2 = (
+            daily_all[daily_all['Date'] == D_prev2][['Id', 'Close_adj']]
+            .rename(columns={'Close_adj': 'c2'})
+        )
+        d23 = (
+            daily_all[daily_all['Date'] == D_prev23][['Id', 'Close_adj']]
+            .rename(columns={'Close_adj': 'c23'})
+        )
+        m = d1.merge(d2, on='Id', how='inner').merge(d23, on='Id', how='inner')
+        m['ShortTermReversal'] = (m['c1'] / m['c2']) - 1
+        m['Momentum21d'] = (m['c2'] / m['c23']) - 1
+
+        # 5-day average dollar volume trend
+        d_ = D_prev
+        dv_list = []
+        for _ in range(5):
+            if d_ is None:
+                break
+            dv_list.append(daily_all[daily_all['Date'] == d_][['Id', 'DollarVol']])
+            d_ = prev_date.get(d_)
+        if len(dv_list) == 5:
+            dv_5d = dv_list[0].rename(columns={'DollarVol': 'v0'})
+            for i, df in enumerate(dv_list[1:], 1):
+                dv_5d = dv_5d.merge(df.rename(columns={'DollarVol': f'v{i}'}), on='Id', how='outer')
+            dv_5d['avg_dv_5d'] = dv_5d[['v0', 'v1', 'v2', 'v3', 'v4']].mean(axis=1)
+            m = m.merge(dv_5d[['Id', 'avg_dv_5d']], on='Id', how='left')
+            m['DollarVolTrend'] = m['avg_dv_5d'] / m['MDV_63_1'].replace(0, np.nan)
+        else:
+            m['DollarVolTrend'] = np.nan
+
+        m = m[['Id', 'ShortTermReversal', 'Momentum21d', 'DollarVolTrend']].copy()
+        m['Date'] = D
+        rows.append(m)
+
+    if rows:
+        daily_feat_df = pd.concat(rows, ignore_index=True)
+        feat_df = feat_df.merge(daily_feat_df, on=['Date', 'Id'], how='left')
+    return feat_df
+
+
+def attach_daily_prev(feat_df, daily_all, prev_date):
+    """Merge previous-day EST_VOL and MDV_63 into feat_df, then compute
+    volume-based and volatility-adjusted features that depend on them.
+
+    Adds / overwrites: EST_VOL_prev, MDV_63_prev, VolumeSurprise,
+    VolumeMorningAfternoonRatio, VolatilityAdjustedReturn.
+    """
+    # Drop stale columns to avoid duplicates on re-run
+    for col in ['EST_VOL_prev', 'MDV_63_prev']:
+        if col in feat_df.columns:
+            feat_df = feat_df.drop(columns=[col])
+
+    daily_prev = build_daily_prev(daily_all, feat_df['Date'].unique(), prev_date)
+    feat_df = feat_df.merge(daily_prev, on=['Date', 'Id'], how='left')
+
+    feat_df['VolumeSurprise'] = (
+        feat_df['CumVolume_1530'] / feat_df['MDV_63_prev'].replace(0, np.nan)
+    )
+    if 'CumVolume_0945' in feat_df.columns and 'CumVolume_1200' in feat_df.columns:
+        _vm = feat_df['CumVolume_1200'] - feat_df['CumVolume_0945']
+        _va = feat_df['CumVolume_1530'] - feat_df['CumVolume_1200']
+        feat_df['VolumeMorningAfternoonRatio'] = _vm / _va.replace(0, np.nan)
+
+    feat_df['VolatilityAdjustedReturn'] = (
+        feat_df['CumReturnResid_1530'] / feat_df['EST_VOL_prev'].replace(0, np.nan)
+    )
+    return feat_df
+
+
+def normalize_features(feat_df):
+    """Apply the three-step normalization pipeline to all features.
+
+    Pipeline per feature:
+      1. TS z-score per Id (rolling past-only window=252, min_periods=60)
+      2. Cross-sectional ±5 MAD winsorization per date
+      3. Cross-sectional z-score per date
+
+    Returns (normalized_feat_df, feature_cols) where normalized_feat_df has
+    only [Date, Id] + feature columns (intermediate columns dropped).
+    """
+    raw_cols = [c for c in ALL_FEATURE_NAMES if c in feat_df.columns]
+
+    for col in raw_cols:
+        feat_df[f'{col}_ts'] = zscore_time_series_per_id(feat_df, col)
+        feat_df[f'{col}_w'] = winsorize_mad(feat_df, f'{col}_ts', n_mad=5)
+        feat_df[f'{col}_norm'] = zscore_cross_sectional(feat_df, f'{col}_w')
+
+    # Drop intermediate columns
+    feat_df = feat_df.drop(
+        columns=[c for c in feat_df.columns if c.endswith('_ts') or c.endswith('_w')],
+        errors='ignore',
+    )
+
+    norm_cols = [c for c in feat_df.columns if c.endswith('_norm')]
+    feat_df = feat_df[['Date', 'Id'] + norm_cols].copy()
+    feat_df.columns = ['Date', 'Id'] + [c.replace('_norm', '') for c in norm_cols]
+
+    feature_cols = [c for c in feat_df.columns if c not in ('Date', 'Id')]
+    feat_df = feat_df.dropna(subset=feature_cols)
+    return feat_df, feature_cols
+
+
+# ---------------------------------------------------------------------------
+# EDA helpers (optional; called from notebook for diagnostics)
+# ---------------------------------------------------------------------------
+
+def eda_stats_one_day(s, n_mad=5, min_n=30):
+    """Cross-section on one date: shape, fraction outside ±n_mad·MAD."""
+    v = pd.to_numeric(s, errors='coerce').dropna().to_numpy()
+    n = len(v)
+    empty = pd.Series({
+        'count': n, 'skew': np.nan, 'excess_kurt': np.nan,
+        'pct_clip_low': np.nan, 'pct_clip_high': np.nan, 'pct_clip_mad': np.nan,
+        'mad': np.nan, 'width_pct_over_mad': np.nan,
+    })
+    if n < min_n:
+        return empty
+    med = float(np.median(v))
+    mad = float(np.median(np.abs(v - med)))
+    skew = float(pd.Series(v).skew())
+    exk = float(pd.Series(v).kurtosis())
+    if not np.isfinite(mad) or mad == 0:
+        return pd.Series({
+            'count': n, 'skew': skew, 'excess_kurt': exk,
+            'pct_clip_low': np.nan, 'pct_clip_high': np.nan, 'pct_clip_mad': np.nan,
+            'mad': mad if np.isfinite(mad) else np.nan, 'width_pct_over_mad': np.nan,
+        })
+    lo, hi = med - n_mad * mad, med + n_mad * mad
+    fl = float((v < lo).mean())
+    fh = float((v > hi).mean())
+    p1, p99 = np.percentile(v, [1, 99])
+    return pd.Series({
+        'count': n, 'skew': skew, 'excess_kurt': exk,
+        'pct_clip_low': fl, 'pct_clip_high': fh, 'pct_clip_mad': fl + fh,
+        'mad': mad, 'width_pct_over_mad': float((p99 - p1) / (2 * n_mad * mad)),
+    })
+
+
+def run_feature_eda(feat_df, raw_cols=None):
+    """Compute per-feature cross-sectional EDA summary across all dates.
+
+    Returns a DataFrame indexed by feature name with median stats.
+    """
+    if raw_cols is None:
+        raw_cols = [c for c in ALL_FEATURE_NAMES if c in feat_df.columns]
+
+    rows = []
+    for col in raw_cols:
+        if col not in feat_df.columns:
+            continue
+        day_stats = pd.DataFrame([
+            eda_stats_one_day(ser)
+            for _, ser in feat_df.groupby('Date', sort=False)[col]
+        ])
+        rows.append({
+            'feature': col,
+            'days': len(day_stats),
+            'median_n': day_stats['count'].median(),
+            'median_skew': day_stats['skew'].median(),
+            'median_excess_kurt': day_stats['excess_kurt'].median(),
+            'median_pct_clip_5MAD': day_stats['pct_clip_mad'].median(),
+            'median_asymmetry': (
+                day_stats['pct_clip_high'] - day_stats['pct_clip_low']
+            ).abs().median(),
+            'median_width_pct_over_mad': day_stats['width_pct_over_mad'].median(),
+            'pct_days_mad_zero': (
+                day_stats['mad'].isna() | (day_stats['mad'] == 0)
+            ).mean() * 100,
+        })
+    return pd.DataFrame(rows).set_index('feature')

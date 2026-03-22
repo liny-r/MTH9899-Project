@@ -1,0 +1,267 @@
+﻿MTH9899 Final Project Intermediate deliverables 
+Prediction problem description 
+1. The purpose of this project is to build a machine learning model to predict the next-day residual stock returns at 15:30 for a universe of approximately 500 stocks, trained on 5 years of data from 2010 to 2014. 
+Target variable
+1. Make predictions at 15:30 for the return over the next 24 hrs i.e. use the next day’s cumulative residual return at 15:30, combined with the return from 15:30 to 16:00 ”today” as your target variable. Consider clipping your target variable prior to fitting.
+Data Source
+1. Daily data
+2. Intraday data 
+Data Cleaning and Preparation
+1. Prepare cumulative residual return target variable by adding returns 15:30-16:00 today with 16:00 today - 15:30 tomorrow. Clip actual returns at 5 MAD cross-sectionally. Normalise returns with EST_VOL before fitting. 
+2. Data cleaning, adjust prices and shares using adjustment factors 
+3. Prepare validation data using only the first 4 years 
+Proposed Technical Features List
+Highlighted = include in intermediate deliverable
+* All features will be computed using information available up to 15:30 on each trading day.
+1. Daily Data
+   1. Risk-adjusted features
+      1. Volatility-adjusted return: normalize intraday return by volatility (return / EST_VOL) to ensure returns are scared by risk 
+   2. Daily time-series features - momentum/ reversal
+      1. Short term momentum/reversal (1-day) - previous day return to capture short-term momentum/reversal across days 
+      2. Medium term momentum - previous 21 day returns to capture short-term momentum across days 
+      3. Momentum acceleration - Difference between 5-day return and 21-day return (recent speed vs. slower trend) to capture whether momentum is accelerating or decelerating.
+      4. Return deviation from moving average (return - MA20)/MA20. Stocks far from their average often revert. 
+   3. Liquidity/ Firm characteristics
+      1. Liquidity - log(MDV63) to distinguish more liquid stocks returns that are more predictable 
+      2. Free float percentage: stocks with smaller float may experience stronger price moves. 
+   4. Volatility signals
+      1. Compute 10-day realized daily return volatility (annualized), divide by EST_VOL. When realized vol is much lower than estimated vol, the stock may be "coiling" before a move; high ratio may signal mean-reversion.
+   5. Volume signals
+      1. Dollar volume trend: ratio of 5-day average volume to MDV_63. Expanding volume relative to recent history may signal building interest.
+2. Intraday Data
+1. Intraday time-series features
+   1. Overnight return: CumReturnResid at the first intraday snapshot (9:45), which captures return from prior day's 16:00 through 9:45. Overnight gap may predict next-day continuation or reversal 
+   2. Short-term Intraday momentum in the last hour (returns from 14:30 - 15:30): Stocks with strong recent momentum may continue trending. 
+   3. Today’s cumulative return from 9:45 - 15:30 captures total intraday movement thus far. Daily strength often persists overnight. 
+   4. Morning momentum (returns from 9:45 - 12:00): Captures early-day market sentiment
+   5. Intraday momentum at 15:30: CumReturnResid at 15:30 minus CumReturnResid at 12:00 (afternoon drift) because late-day price pressure often persists into the next day 
+   6. Intraday reversal - difference between early day return (returns from 9:45 - 12:00) and afternoon return (returns from 12:00 - 15:30) captures potential mean reversion behaviour
+2. Volatility signals
+   1. Intraday volatility - standard deviation of intraday returns during the day up to 15:30 to capture intraday volatility.
+3. Volume signals 
+   1. Volume surprise - cumulative volume today until 15:30 / MDV63 to detect unusual trading activity like informed trading or news 
+   2. Intraday volume acceleration: CumVolume at 15:30 divided by CumVolume at 12:00. If volume is picking up significantly in the afternoon, it signals conviction in the move
+   3. Late day volume spike: (volume 14:30-15:30 / volume 9:45 - 14:30) Large late-date volume may signal price pressure continuing into the close. 
+   4. Return-volume correlation (intraday): Compute the correlation between the 15-minute return increments and volume increments throughout the day. Price moves accompanied by rising volume are more likely to be "real" signals.
+4. Cross-sectional features 
+   1. Cross-sectional relative return rank: cross-sectional rank of today’s return across stocks 
+   2. Cross-sectional relative volume rank: cross-sectional rank of today’s volume / MDV_63 across stocks 
+Text Features 
+1. Earnings call transcripts 
+   1. Sentiment score: a positive sentiment score is expected to have a likely positive impact on returns. Score the tone of the earning call transcripts using the Loughran–McDonald financial sentiment dictionary.
+   2. Change in sentiment: Compare sentiment scores between from the previous call and the current call. Improving sentiment may predict positive returns. 
+   3. Earnings surprise language: Certain languages may indicate unexpected strong/weak performance. 
+   4. Management confidence and outlook: measure frequency of words like “growth”, “strong”, “opportunity”, “expansion”
+   5. Management uncertainty score: measure frequency of words like “uncertain”, “difficult”, “challenging” and "unpredictable", often predicts higher volatility and negative drift.
+   6. Innovation and growth score: measure frequency of worlds like “innovation”, “technology”, “R&D” 
+2. 10-Q filing 
+   1. Risk disclosure frequency: count words related to risk in 10-Q filings. This gives insight into the company’s risk management attitude and approaches or their current risk discussions. 
+   2. 10-Q filing change score: Compute the cosine similarity between the current quarter's 10-Q risk factors section and the prior quarter's
+Model choices
+1. Regularized OLS - ridge regression
+2. Random Forest Regressor
+3. XGBoost 
+
+
+
+
+Others:
+1. Survivorship bias 
+2. Winsorize/normalize features cross-sectionally per date 
+
+
+Detailed description of features 
+
+
+Section 1: Daily Data Features
+1.1 Risk-Adjusted Features
+Feature
+	Definition
+	Formula / Pseudocode
+	Normalization
+	Motivation
+	Volatility-Adjusted Return
+	Intraday residual return scaled by the stock's annualized volatility estimate, so that returns are expressed in units of risk.
+	feat = CumReturnResid_1530 / EST_VOL
+	Winsorize at ±5 cross-sectionally per date, then z-score cross-sectionally within each date.
+	Scaling by volatility puts all stocks on a comparable risk-adjusted basis. A large raw return from a low-vol stock carries more information than the same return from a high-vol stock.
+	 
+1.2 Momentum & Reversal Features
+Feature
+	Definition
+	Formula / Pseudocode
+	Normalization
+	Motivation
+	Short-Term Reversal (1-day)
+	Prior day's adjusted close-to-close return. Captures the well-known 1-day reversal effect in equities.
+	ret_1d = (Close_{t-1} * PxAdjFactor_{t-1}) / (Close_{t-2} * PxAdjFactor_{t-2}) - 1
+	Winsorize at ±5 MAD cross-sectionally per date. Z-score cross-sectionally within each date.
+	Short-term return reversal is one of the most robust anomalies: yesterday's losers tend to outperform and vice versa, driven by market microstructure and liquidity provision.
+	Medium-Term Momentum (5d & 21d)
+	Cumulative adjusted return over the past 5 or 21 trading days, skipping day t-1 to avoid reversal contamination.
+	ret_5d = (Close_{t-2} * PxAdj_{t-2}) / (Close_{t-7} * PxAdj_{t-7}) - 1 ret_21d = (Close_{t-2} * PxAdj_{t-2}) / (Close_{t-23} * PxAdj_{t-23}) - 1
+	Winsorize each at ±5 MAD cross-sectionally. Z-score cross-sectionally within each date.
+	Medium-term momentum (1-12 months) is a classic factor. Recent winners tend to continue outperforming over the next month, likely due to delayed investor reaction to news.
+	Momentum Acceleration
+	Difference between the 5-day return and the 21-day return. Measures whether recent momentum is speeding up or slowing down relative to the longer-run trend.
+	mom_accel = ret_5d - ret_21d
+	Winsorize at ±5 MAD cross-sectionally. Z-score cross-sectionally within each date.
+	A stock with accelerating momentum (5d >> 21d) may signal a fresh catalyst; decelerating momentum may signal exhaustion. This captures a non-linear aspect not present in either return alone.
+	Return Deviation from Moving Average
+	Distance of today's close from its 20-day moving average, normalized by the moving average. Captures how far the stock has strayed from its recent trend.
+	ma20 = mean(Close_{t-1} ... Close_{t-20}, adjusted) feat = (Close_{t-1,adj} - ma20) / ma20
+	Winsorize at ±5 MAD cross-sectionally. Z-score cross-sectionally within each date.
+	Stocks far above their moving average tend to mean-revert; stocks far below may also revert. This is a widely used technical signal for identifying stretched valuations relative to recent history.
+	 
+1.3 Liquidity & Firm Characteristics
+Feature
+	Definition
+	Formula / Pseudocode
+	Normalization
+	Motivation
+	Log Liquidity (MDV_63)
+	Natural log of the median daily dollar volume over the past 63 trading days. Captures the size/liquidity tier of the stock.
+	feat = log(MDV_63)
+	No winsorization needed (log compresses scale). Z-score cross-sectionally within each date.
+	More liquid stocks have more efficient prices and different return dynamics than illiquid ones. Including log(MDV_63) lets the model adjust predictions based on liquidity regime.
+	Free Float Percentage
+	The fraction of shares freely available for public trading. Low-float stocks have fewer shares available and can experience amplified price moves.
+	feat = FREE_FLOAT_PERCENTAGE (raw field)
+	Winsorize at [1st, 99th] percentile cross-sectionally. Z-score cross-sectionally within each date.
+	Stocks with a smaller free float have less liquidity buffer against buying/selling pressure, making their returns more volatile and potentially more predictable from volume signals.
+	 
+1.4 Volatility Signals
+Feature
+	Definition
+	Formula / Pseudocode
+	Normalization
+	Motivation
+	Realized Vol / EST_VOL Ratio
+	Ratio of the stock's 10-day realized daily return volatility (annualized) to EST_VOL. Measures whether realized risk is below or above the model's estimate.
+	realized_vol = std(daily_rets last 10d) * sqrt(252) feat = realized_vol / EST_VOL
+	Winsorize at [1st, 99th] percentile cross-sectionally. Z-score cross-sectionally within each date.
+	When realized vol is much lower than EST_VOL the stock may be 'coiling' before a breakout. A high ratio may signal mean-reversion as extreme moves normalize. Both regimes may have return predictability.
+	 
+1.5 Volume Signals
+Feature
+	Definition
+	Formula / Pseudocode
+	Normalization
+	Motivation
+	Dollar Volume Trend
+	Ratio of the 5-day average daily dollar volume to MDV_63. Detects whether recent trading interest is expanding or contracting relative to the 3-month baseline.
+	avg_vol_5d = mean(Volume_{t-1}...Volume_{t-5} * Close_adj) feat = avg_vol_5d / MDV_63
+	Winsorize at ±5 MAD cross-sectionally. Z-score cross-sectionally within each date.
+	Expanding volume relative to the 3-month average may signal growing investor interest or an emerging news catalyst, both of which can precede a persistent price move.
+	 
+Section 2: Intraday Data Features
+2.1 Intraday Time-Series Features
+Feature
+	Definition
+	Formula / Pseudocode
+	Normalization
+	Motivation
+	Overnight Return
+	CumReturnResid at the first intraday snapshot (9:45), capturing the residual return from the prior day's 16:00 close through 9:45 AM.
+	feat = CumReturnResid at time 09:45
+	Winsorize at ±5 MAD cross-sectionally. Z-score cross-sectionally within each date.
+	Overnight gaps reflect after-hours news and pre-market sentiment. Large overnight moves may predict continuation (news drift) or reversal (overreaction), making this a strong predictor.
+	Short-Term Intraday Momentum (14:30-15:30)
+	Return during the last hour before prediction time. Captures very recent price pressure heading into the close.
+	feat = CumReturnResid_1530 - CumReturnResid_1430
+	Winsorize at ±5 MAD cross-sectionally. Z-score cross-sectionally within each date.
+	Strong momentum in the last hour often reflects end-of-day institutional order flow or positioning. This near-term pressure frequently persists into the next trading session.
+	Total Intraday Return (9:45-15:30)
+	Cumulative residual return from market open through the prediction window at 15:30. Captures the full intraday directional move.
+	feat = CumReturnResid_1530 - CumReturnResid_0945
+	Winsorize at ±5 MAD cross-sectionally. Z-score cross-sectionally within each date.
+	A strong full-day move often reflects a fundamental catalyst that can continue into the next day (momentum) or has already been fully priced in (reversal). Interaction with volume distinguishes the two.
+	Morning Momentum (9:45-12:00)
+	Residual return during the morning session only. Captures how the stock behaved in the first half of the day before afternoon dynamics set in.
+	feat = CumReturnResid_1200 - CumReturnResid_0945
+	Winsorize at ±5 MAD cross-sectionally. Z-score cross-sectionally within each date.
+	Morning returns reflect opening sentiment and early reaction to news. A strong morning that fades suggests reversal pressure; a slow morning that accelerates in the afternoon signals conviction.
+	Afternoon Drift (12:00-15:30)
+	Residual return during the afternoon session only. Captures late-day directional price pressure distinct from the morning move.
+	feat = CumReturnResid_1530 - CumReturnResid_1200
+	Winsorize at ±5 MAD cross-sectionally. Z-score cross-sectionally within each date.
+	Late-day price pressure is associated with institutional portfolio rebalancing and often persists into the next day. Separating afternoon from morning isolates this effect.
+	Intraday Reversal (Morning minus Afternoon)
+	Difference between the morning return and the afternoon return. A positive value means the stock surged in the morning but gave back gains in the afternoon.
+	feat = (CumReturnResid_1200 - CumReturnResid_0945) - (CumReturnResid_1530 - CumReturnResid_1200)
+	Winsorize at ±5 MAD cross-sectionally. Z-score cross-sectionally within each date.
+	When a strong morning move reverses in the afternoon, it often signals the initial move was an overreaction. This pattern tends to continue into the next day, creating a short-term mean-reversion signal.
+	 
+2.2 Intraday Volatility Signals
+Feature
+	Definition
+	Formula / Pseudocode
+	Normalization
+	Motivation
+	Intraday Volatility
+	Standard deviation of the 15-minute interval return increments from 9:45 to 15:30 (i.e., the standard deviation of the per-interval changes in CumReturnResid).
+	intervals = [CumReturnResid_t - CumReturnResid_{t-1} for each 15-min step] feat = std(intervals)
+	Winsorize at [1st, 99th] percentile cross-sectionally. Z-score cross-sectionally within each date.
+	High intraday volatility may indicate news uncertainty or an active trading catalyst. Combined with directional signals, it helps distinguish noisy noise from informed moves.
+	 
+2.3 Intraday Volume Signals
+Feature
+	Definition
+	Formula / Pseudocode
+	Normalization
+	Motivation
+	Volume Surprise
+	Ratio of cumulative volume from 9:45 to 15:30 today to MDV_63 (the 3-month average daily volume baseline). Detects unusual trading activity.
+	feat = CumVolume_1530 / MDV_63
+	Winsorize at [1st, 99th] percentile cross-sectionally. Z-score cross-sectionally within each date.
+	Abnormally high volume relative to the historical baseline signals informed trading, a news catalyst, or index rebalancing. High-volume moves are more likely to be 'real' and to persist.
+	Intraday Volume Acceleration
+	Ratio of cumulative volume at 15:30 to cumulative volume at 12:00. Captures whether trading activity is picking up or slowing in the second half of the day.
+	feat = CumVolume_1530 / CumVolume_1200
+	Winsorize at [1st, 99th] percentile cross-sectionally. Z-score cross-sectionally within each date.
+	Accelerating afternoon volume signals rising conviction in a directional move and is often associated with institutional order flow. A price move backed by accelerating volume is more likely to persist overnight.
+	Late-Day Volume Spike
+	Ratio of volume in the last hour (14:30-15:30) to the volume in the earlier part of the day (9:45-14:30). Detects a spike in activity close to the prediction time.
+	vol_late = CumVolume_1530 - CumVolume_1430 vol_early = CumVolume_1430 - CumVolume_0945 feat = vol_late / vol_early
+	Winsorize at [1st, 99th] percentile cross-sectionally. Z-score cross-sectionally within each date.
+	A large late-day volume spike relative to the earlier session indicates unusual end-of-day positioning, which can create price pressure that continues through the close and into the next morning.
+	Return-Volume Correlation (Intraday)
+	Pearson correlation between the 15-minute return increments and 15-minute volume increments throughout the day, computed per stock per day using all intervals up to 15:30.
+	ret_inc = diff(CumReturnResid) vol_inc = diff(CumVolume) feat = corr(ret_inc, vol_inc)
+	No winsorization (correlation is bounded [-1,1]). Z-score cross-sectionally within each date.
+	When price moves occur alongside increasing volume, they are more likely to reflect genuine information rather than noise or thin-market artifacts. High correlation suggests the directional move is conviction-backed.
+	 
+2.4 Cross-Sectional Features
+Feature
+	Definition
+	Formula / Pseudocode
+	Normalization
+	Motivation
+	Cross-Sectional Return Rank
+	Percentile rank of today's total intraday residual return (9:45-15:30) relative to all stocks in the universe on the same date.
+	feat = rank(CumReturnResid_1530 - CumReturnResid_0945) / N  (per date)
+	Ranks are bounded [0,1] by construction. No further winsorization needed. Optionally apply a normal quantile transform to map to N(0,1).
+	Cross-sectional ranking removes the common market factor and focuses on relative performance. Extreme-ranked stocks (top or bottom decile) often exhibit continuation or reversal that raw return levels miss.
+	Cross-Sectional Volume Rank
+	Percentile rank of today's volume surprise (CumVolume_1530 / MDV_63) relative to all stocks in the universe on the same date.
+	feat = rank(CumVolume_1530 / MDV_63) / N  (per date)
+	Ranks are bounded [0,1] by construction. Optionally apply a normal quantile transform.
+	Ranking volume surprise cross-sectionally identifies which stocks had unusually high activity relative to peers on the same day, regardless of market-wide volume conditions. High-rank stocks are more likely to experience persistent moves.
+	 
+Section 3: Text Feature Ideas (10-Q Filings & Earnings Call Transcripts)
+The following describes two features we would create if required to use the latest available 10-Q filing and/or earnings call transcripts. We are not using this data in our model, but describe the methodology below.
+Feature
+	Definition
+	Formula / Pseudocode
+	Normalization
+	Motivation
+	Earnings Call Sentiment Score
+	A sentiment score derived from the most recent available 10-Q earnings call transcript, computed using the Loughran-McDonald financial sentiment lexicon. Scores the tone of management's prepared remarks and Q&A separately.
+	positive_words = count of L-M positive words in transcript negative_words = count of L-M negative words feat = (positive - negative) / total_word_count
+	Winsorize at [1st, 99th] percentile. Z-score cross-sectionally within each fiscal quarter cohort to control for industry/era differences in tone.
+	Management language in earnings calls contains forward-looking signals beyond the numbers. Negative tone predicts negative abnormal returns in subsequent days; the Q&A section is particularly informative as it reflects unscripted reactions to analyst pressure.
+	10-Q Risk Factor Change Score
+	A measure of how much the risk factors section of the most recent 10-Q has changed relative to the prior quarter's 10-Q, using cosine similarity of TF-IDF vectors of the risk section text.
+	tfidf_curr = TF-IDF(risk_section_current_quarter) tfidf_prev = TF-IDF(risk_section_prior_quarter) feat = 1 - cosine_similarity(tfidf_curr, tfidf_prev)
+	Winsorize at [1st, 99th] percentile cross-sectionally. Z-score cross-sectionally within each filing quarter cohort.
+	Managers strategically expand or modify risk factor language when they anticipate material new risks. A high dissimilarity score (lots of new language) predicts negative abnormal returns in the months following the filing, as risks eventually materialize.

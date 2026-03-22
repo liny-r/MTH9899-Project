@@ -1,3 +1,6 @@
-data_intraday/
-hw2/
+DailyData/
+data_intraday/ 
 .DS_Store
+__pycache__/
+*.pyc
+*.pyo
