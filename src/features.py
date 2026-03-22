@@ -3,6 +3,7 @@
 import numpy as np
 import pandas as pd
 from tqdm.auto import tqdm
+from joblib import Parallel, delayed
 
 from .utils import (
     TS_WINDOW, TS_MIN_PERIODS,
@@ -102,6 +103,16 @@ def features_single_day(r, v, date_int):
     return out.reset_index(drop=True)
 
 
+def _intraday_one_day(date_str, dev_dates, intraday_dir):
+    date_int = int(date_str)
+    if date_int not in dev_dates:
+        return None
+    r, v = load_day_pivoted(date_str, intraday_dir)
+    if r is None:
+        return None
+    return features_single_day(r, v, date_int)
+
+
 def build_intraday_features(date_strings, dev_dates, intraday_dir=INTRADAY_DIR):
     """Loop over all dev dates and compute raw intraday features.
 
@@ -113,16 +124,56 @@ def build_intraday_features(date_strings, dev_dates, intraday_dir=INTRADAY_DIR):
     Returns concatenated DataFrame of raw intraday features.
     """
     dev_dates = set(dev_dates)
-    dfs = []
-    for date_str in tqdm(date_strings, desc='Intraday features'):
-        date_int = int(date_str)
-        if date_int not in dev_dates:
-            continue
-        r, v = load_day_pivoted(date_str, intraday_dir)
-        if r is None:
-            continue
-        dfs.append(features_single_day(r, v, date_int))
+    results = Parallel(n_jobs=-1, prefer='threads')(
+        delayed(_intraday_one_day)(date_str, dev_dates, intraday_dir)
+        for date_str in tqdm(date_strings, desc='Intraday features')
+    )
+    dfs = [r for r in results if r is not None]
     return pd.concat(dfs, ignore_index=True)
+
+
+def _daily_one_date(D, daily_by_date, prev_date, date_to_idx, date_list):
+    if D not in prev_date:
+        return None
+    D_prev = prev_date[D]
+    D_prev2 = prev_date.get(D_prev)
+    if D_prev2 is None:
+        return None
+    idx = date_to_idx.get(D)
+    if idx is None or idx < 23:
+        return None
+    D_prev23 = date_list[idx - 23]
+
+    if D_prev not in daily_by_date or D_prev2 not in daily_by_date or D_prev23 not in daily_by_date:
+        return None
+
+    d1  = daily_by_date[D_prev][['Close_adj', 'DollarVol', 'MDV_63']].rename(
+        columns={'Close_adj': 'c1', 'DollarVol': 'dv1', 'MDV_63': 'MDV_63_1'})
+    d2  = daily_by_date[D_prev2][['Close_adj']].rename(columns={'Close_adj': 'c2'})
+    d23 = daily_by_date[D_prev23][['Close_adj']].rename(columns={'Close_adj': 'c23'})
+
+    m = d1.join(d2, how='inner').join(d23, how='inner').reset_index()
+    m['ShortTermReversal'] = (m['c1'] / m['c2']) - 1
+    m['Momentum21d']       = (m['c2'] / m['c23']) - 1
+
+    dv_cols = {}
+    d_ = D_prev
+    for i in range(5):
+        if d_ is None or d_ not in daily_by_date:
+            break
+        dv_cols[f'v{i}'] = daily_by_date[d_]['DollarVol']
+        d_ = prev_date.get(d_)
+
+    if len(dv_cols) == 5:
+        dv_5d = pd.concat(dv_cols, axis=1)
+        m = m.join(dv_5d.mean(axis=1).rename('avg_dv_5d'), on='Id', how='left')
+        m['DollarVolTrend'] = m['avg_dv_5d'] / m['MDV_63_1'].replace(0, np.nan)
+    else:
+        m['DollarVolTrend'] = np.nan
+
+    m = m[['Id', 'ShortTermReversal', 'Momentum21d', 'DollarVolTrend']].copy()
+    m['Date'] = D
+    return m
 
 
 def build_daily_features(feat_df, daily_all, date_list, prev_date):
@@ -141,51 +192,13 @@ def build_daily_features(feat_df, daily_all, date_list, prev_date):
         for d, grp in daily_all.groupby('Date')
     }
     date_to_idx = {d: i for i, d in enumerate(date_list)}
+    unique_dates = feat_df['Date'].unique()
 
-    rows = []
-    for D in tqdm(feat_df['Date'].unique(), desc='Daily features'):
-        if D not in prev_date:
-            continue
-        D_prev = prev_date[D]
-        D_prev2 = prev_date.get(D_prev)
-        if D_prev2 is None:
-            continue
-        idx = date_to_idx.get(D)
-        if idx is None or idx < 23:
-            continue
-        D_prev23 = date_list[idx - 23]  # 21 trading days before D_prev (at idx-2)
-
-        if D_prev not in daily_by_date or D_prev2 not in daily_by_date or D_prev23 not in daily_by_date:
-            continue
-
-        d1  = daily_by_date[D_prev][['Close_adj', 'DollarVol', 'MDV_63']].rename(
-            columns={'Close_adj': 'c1', 'DollarVol': 'dv1', 'MDV_63': 'MDV_63_1'})
-        d2  = daily_by_date[D_prev2][['Close_adj']].rename(columns={'Close_adj': 'c2'})
-        d23 = daily_by_date[D_prev23][['Close_adj']].rename(columns={'Close_adj': 'c23'})
-
-        m = d1.join(d2, how='inner').join(d23, how='inner').reset_index()
-        m['ShortTermReversal'] = (m['c1'] / m['c2']) - 1
-        m['Momentum21d']       = (m['c2'] / m['c23']) - 1
-
-        # 5-day average dollar volume trend
-        dv_cols = {}
-        d_ = D_prev
-        for i in range(5):
-            if d_ is None or d_ not in daily_by_date:
-                break
-            dv_cols[f'v{i}'] = daily_by_date[d_]['DollarVol']
-            d_ = prev_date.get(d_)
-
-        if len(dv_cols) == 5:
-            dv_5d = pd.concat(dv_cols, axis=1)  # index=Id, columns=v0..v4
-            m = m.join(dv_5d.mean(axis=1).rename('avg_dv_5d'), on='Id', how='left')
-            m['DollarVolTrend'] = m['avg_dv_5d'] / m['MDV_63_1'].replace(0, np.nan)
-        else:
-            m['DollarVolTrend'] = np.nan
-
-        m = m[['Id', 'ShortTermReversal', 'Momentum21d', 'DollarVolTrend']].copy()
-        m['Date'] = D
-        rows.append(m)
+    results = Parallel(n_jobs=-1, prefer='threads')(
+        delayed(_daily_one_date)(D, daily_by_date, prev_date, date_to_idx, date_list)
+        for D in tqdm(unique_dates, desc='Daily features')
+    )
+    rows = [r for r in results if r is not None]
 
     if rows:
         daily_feat_df = pd.concat(rows, ignore_index=True)
@@ -222,6 +235,22 @@ def attach_daily_prev(feat_df, daily_all, prev_date):
     return feat_df
 
 
+def _normalize_one_feature(base_df, col):
+    """Run the three-step normalization for a single feature column.
+
+    Returns a Series of normalized values aligned to base_df's index.
+    """
+    tmp = base_df[['Date', 'Id', col]].copy()
+    tmp['_ts'] = zscore_time_series_per_id(tmp, col)
+    if col in PCT_FEATURES:
+        tmp['_w'] = winsorize_percentile(tmp, '_ts')
+    elif col in NO_WINSOR_FEATURES:
+        tmp['_w'] = tmp['_ts']
+    else:
+        tmp['_w'] = winsorize_mad(tmp, '_ts', n_mad=5)
+    return zscore_cross_sectional(tmp, '_w')
+
+
 def normalize_features(feat_df):
     """Apply the three-step normalization pipeline to all features.
 
@@ -235,29 +264,18 @@ def normalize_features(feat_df):
     """
     raw_cols = [c for c in ALL_FEATURE_NAMES if c in feat_df.columns]
 
-    for col in tqdm(raw_cols, desc='Normalizing features'):
-        feat_df[f'{col}_ts'] = zscore_time_series_per_id(feat_df, col)
-        if col in PCT_FEATURES:
-            feat_df[f'{col}_w'] = winsorize_percentile(feat_df, f'{col}_ts')
-        elif col in NO_WINSOR_FEATURES:
-            feat_df[f'{col}_w'] = feat_df[f'{col}_ts']
-        else:  # MAD_FEATURES
-            feat_df[f'{col}_w'] = winsorize_mad(feat_df, f'{col}_ts', n_mad=5)
-        feat_df[f'{col}_norm'] = zscore_cross_sectional(feat_df, f'{col}_w')
-
-    # Drop intermediate columns
-    feat_df = feat_df.drop(
-        columns=[c for c in feat_df.columns if c.endswith('_ts') or c.endswith('_w')],
-        errors='ignore',
+    results = Parallel(n_jobs=-1, prefer='threads')(
+        delayed(_normalize_one_feature)(feat_df, col)
+        for col in tqdm(raw_cols, desc='Normalizing features')
     )
 
-    norm_cols = [c for c in feat_df.columns if c.endswith('_norm')]
-    feat_df = feat_df[['Date', 'Id'] + norm_cols].copy()
-    feat_df.columns = ['Date', 'Id'] + [c.replace('_norm', '') for c in norm_cols]
+    out = feat_df[['Date', 'Id']].copy()
+    for col, normed in zip(raw_cols, results):
+        out[col] = normed
 
-    feature_cols = [c for c in feat_df.columns if c not in ('Date', 'Id')]
-    feat_df = feat_df.dropna(subset=feature_cols)
-    return feat_df, feature_cols
+    feature_cols = list(raw_cols)
+    out = out.dropna(subset=feature_cols)
+    return out, feature_cols
 
 
 # ---------------------------------------------------------------------------

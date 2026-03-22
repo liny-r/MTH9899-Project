@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from tqdm.auto import tqdm
+from joblib import Parallel, delayed
 
 from .utils import zscore_time_series_per_id, winsorize_mad, zscore_cross_sectional
 from .data import build_daily_prev, INTRADAY_DIR
@@ -52,11 +53,12 @@ def build_all_targets(date_strings, intraday_dir=INTRADAY_DIR):
 
     Returns DataFrame with columns: Date, Id, Target, part_a, part_b.
     """
-    dfs = []
-    for i in tqdm(range(len(date_strings) - 1), desc='Building targets'):
-        one = build_target_single_day(date_strings[i], date_strings[i + 1], intraday_dir)
-        if one is not None:
-            dfs.append(one)
+    pairs = [(date_strings[i], date_strings[i + 1]) for i in range(len(date_strings) - 1)]
+    results = Parallel(n_jobs=-1, prefer='threads')(
+        delayed(build_target_single_day)(d, d_next, intraday_dir)
+        for d, d_next in tqdm(pairs, desc='Building targets')
+    )
+    dfs = [r for r in results if r is not None]
     return pd.concat(dfs, ignore_index=True)
 
 
