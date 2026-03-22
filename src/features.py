@@ -2,6 +2,7 @@
 
 import numpy as np
 import pandas as pd
+from tqdm.auto import tqdm
 
 from .utils import (
     TS_WINDOW, TS_MIN_PERIODS,
@@ -113,7 +114,7 @@ def build_intraday_features(date_strings, dev_dates, intraday_dir=INTRADAY_DIR):
     """
     dev_dates = set(dev_dates)
     dfs = []
-    for date_str in date_strings:
+    for date_str in tqdm(date_strings, desc='Intraday features'):
         date_int = int(date_str)
         if date_int not in dev_dates:
             continue
@@ -142,7 +143,7 @@ def build_daily_features(feat_df, daily_all, date_list, prev_date):
     date_to_idx = {d: i for i, d in enumerate(date_list)}
 
     rows = []
-    for D in feat_df['Date'].unique():
+    for D in tqdm(feat_df['Date'].unique(), desc='Daily features'):
         if D not in prev_date:
             continue
         D_prev = prev_date[D]
@@ -234,7 +235,7 @@ def normalize_features(feat_df):
     """
     raw_cols = [c for c in ALL_FEATURE_NAMES if c in feat_df.columns]
 
-    for col in raw_cols:
+    for col in tqdm(raw_cols, desc='Normalizing features'):
         feat_df[f'{col}_ts'] = zscore_time_series_per_id(feat_df, col)
         if col in PCT_FEATURES:
             feat_df[f'{col}_w'] = winsorize_percentile(feat_df, f'{col}_ts')

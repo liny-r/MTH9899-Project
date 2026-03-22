@@ -5,8 +5,8 @@ import numpy as np
 from pathlib import Path
 
 # Default paths relative to the MTH9899-Project/ directory
-DAILY_DIR = '../DailyData'
-INTRADAY_DIR = '../data_intraday'
+DAILY_DIR = 'DailyData'
+INTRADAY_DIR = 'data_intraday'
 
 
 def build_date_maps(intraday_dir=INTRADAY_DIR):

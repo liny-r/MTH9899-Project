@@ -68,4 +68,4 @@ def zscore_cross_sectional(df, col):
 
 def weighted_r2(y_true, y_pred, weight):
     """Weighted R² as per spec: weights = sqrt(MDV_63) for evaluation."""
-    return r2_score(y_true, y_pred, weight=weight)
+    return r2_score(y_true, y_pred, sample_weight=weight)

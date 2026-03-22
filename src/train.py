@@ -12,6 +12,7 @@ from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
 from itertools import product
 from joblib import Parallel, delayed
+from tqdm.auto import tqdm
 
 from .utils import weighted_r2
 
@@ -84,7 +85,7 @@ def train_ridge(X_train, y_train, w_train, X_val, y_val, w_val):
     """
     scores = Parallel(n_jobs=-1, prefer='threads')(
         delayed(_ridge_one_alpha)(a, X_train, y_train, w_train, X_val, y_val, w_val)
-        for a in RIDGE_GRID['alpha']
+        for a in tqdm(RIDGE_GRID['alpha'], desc='Ridge α', leave=False)
     )
     results = pd.DataFrame(scores)
     best_alpha = results.loc[results['val_weighted_r2'].idxmax(), 'alpha']
@@ -105,18 +106,17 @@ def train_random_forest(X_train, y_train, w_train, X_val, y_val, w_val):
     n_train = X_train.shape[0]
     max_samples = min(80_000, n_train)
     scores = []
-    for ne in RF_GRID['n_estimators']:
-        for md in RF_GRID['max_depth']:
-            for ml in RF_GRID['min_samples_leaf']:
-                m = RandomForestRegressor(
-                    n_estimators=ne, max_depth=md, min_samples_leaf=ml,
-                    max_samples=max_samples, random_state=RANDOM_STATE, n_jobs=-1,
-                )
-                m.fit(X_train, y_train, sample_weight=w_train)
-                scores.append({
-                    'n_estimators': ne, 'max_depth': md, 'min_samples_leaf': ml,
-                    'val_weighted_r2': weighted_r2(y_val, m.predict(X_val), w_val),
-                })
+    rf_configs = list(product(RF_GRID['n_estimators'], RF_GRID['max_depth'], RF_GRID['min_samples_leaf']))
+    for ne, md, ml in tqdm(rf_configs, desc='RF grid search'):
+        m = RandomForestRegressor(
+            n_estimators=ne, max_depth=md, min_samples_leaf=ml,
+            max_samples=max_samples, random_state=RANDOM_STATE, n_jobs=-1,
+        )
+        m.fit(X_train, y_train, sample_weight=w_train)
+        scores.append({
+            'n_estimators': ne, 'max_depth': md, 'min_samples_leaf': ml,
+            'val_weighted_r2': weighted_r2(y_val, m.predict(X_val), w_val),
+        })
     results = pd.DataFrame(scores)
     best = results.loc[results['val_weighted_r2'].idxmax()]
     model = RandomForestRegressor(
@@ -141,18 +141,17 @@ def train_xgboost(X_train, y_train, w_train, X_val, y_val, w_val):
     if not HAS_XGB:
         return None, np.nan, pd.DataFrame()
     scores = []
-    for md in XGB_GRID['max_depth']:
-        for lr in XGB_GRID['learning_rate']:
-            for ne in XGB_GRID['n_estimators']:
-                m = xgb.XGBRegressor(
-                    n_estimators=ne, max_depth=md, learning_rate=lr,
-                    random_state=RANDOM_STATE, n_jobs=-1,
-                )
-                m.fit(X_train, y_train, sample_weight=w_train)
-                scores.append({
-                    'max_depth': md, 'learning_rate': lr, 'n_estimators': ne,
-                    'val_weighted_r2': weighted_r2(y_val, m.predict(X_val), w_val),
-                })
+    xgb_configs = list(product(XGB_GRID['max_depth'], XGB_GRID['learning_rate'], XGB_GRID['n_estimators']))
+    for md, lr, ne in tqdm(xgb_configs, desc='XGB grid search'):
+        m = xgb.XGBRegressor(
+            n_estimators=ne, max_depth=md, learning_rate=lr,
+            random_state=RANDOM_STATE, n_jobs=-1,
+        )
+        m.fit(X_train, y_train, sample_weight=w_train)
+        scores.append({
+            'max_depth': md, 'learning_rate': lr, 'n_estimators': ne,
+            'val_weighted_r2': weighted_r2(y_val, m.predict(X_val), w_val),
+        })
     results = pd.DataFrame(scores)
     best = results.loc[results['val_weighted_r2'].idxmax()]
     model = xgb.XGBRegressor(
@@ -189,10 +188,10 @@ def train_elasticnet(X_train, y_train, w_train, X_val, y_val, w_val, tune_max_ro
     else:
         Xt, yt, wt = X_train, y_train, w_train
 
+    en_configs = list(product(ELASTICNET_GRID['alpha'], ELASTICNET_GRID['l1_ratio']))
     scores = Parallel(n_jobs=-1, prefer='processes')(
         delayed(_elasticnet_one_config)(a, l1, Xt, yt, wt, X_val, y_val, w_val)
-        for a in ELASTICNET_GRID['alpha']
-        for l1 in ELASTICNET_GRID['l1_ratio']
+        for a, l1 in tqdm(en_configs, desc='ElasticNet grid', leave=False)
     )
     results = pd.DataFrame(scores)
     best = results.loc[results['val_weighted_r2'].idxmax()]
@@ -243,7 +242,7 @@ def train_mlp(X_train, y_train, w_train, X_val, y_val, w_val,
     ))
     scores = Parallel(n_jobs=-1, prefer='processes')(
         delayed(_mlp_one_config)(cfg, Xm, ym, wm, X_val, y_val, w_val, 250, batch_size)
-        for cfg in grid
+        for cfg in tqdm(grid, desc='MLP grid search', leave=False)
     )
     results = pd.DataFrame(scores)
     best = results.loc[results['val_weighted_r2'].idxmax()]
