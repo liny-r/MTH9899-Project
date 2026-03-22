@@ -24,6 +24,25 @@ except ImportError:
 
 RANDOM_STATE = 42
 
+# --- Hyperparameter grids (edit here to change search ranges) ---
+RIDGE_GRID = {
+    'alpha': np.logspace(-3, 3, 25).tolist(),
+}
+RF_GRID = {
+    'n_estimators':     [80, 150],
+    'max_depth':        [5, 7, 10],
+    'min_samples_leaf': [10, 20],
+}
+XGB_GRID = {
+    'max_depth':     [3, 4, 5, 6],
+    'learning_rate': [0.03, 0.05, 0.1],
+    'n_estimators':  [100, 200, 300],
+}
+ELASTICNET_GRID = {
+    'alpha':    np.logspace(-5, -0.5, 12).tolist(),
+    'l1_ratio': [0.1, 0.5, 0.8, 0.9, 0.95, 1.0],
+}
+
 
 def prepare_matrices(train_df, val_df, feature_cols):
     """Standardize features and extract X/y/w arrays for train and validation.
@@ -51,17 +70,22 @@ def prepare_matrices(train_df, val_df, feature_cols):
     return X_train, y_train, w_train, X_val, y_val, w_val, scaler
 
 
+def _ridge_one_alpha(alpha, X_train, y_train, w_train, X_val, y_val, w_val):
+    """Fit Ridge for one alpha value (used by joblib.Parallel)."""
+    m = Ridge(alpha=alpha, random_state=RANDOM_STATE)
+    m.fit(X_train, y_train, sample_weight=w_train)
+    return {'alpha': alpha, 'val_weighted_r2': weighted_r2(y_val, m.predict(X_val), w_val)}
+
+
 def train_ridge(X_train, y_train, w_train, X_val, y_val, w_val):
     """Train Ridge regression with grid search over alpha.
 
     Returns (fitted model, val weighted R², results DataFrame).
     """
-    alphas = np.logspace(-3, 3, 25)
-    scores = []
-    for alpha in alphas:
-        m = Ridge(alpha=alpha, random_state=RANDOM_STATE)
-        m.fit(X_train, y_train, sample_weight=w_train)
-        scores.append({'alpha': alpha, 'val_weighted_r2': weighted_r2(y_val, m.predict(X_val), w_val)})
+    scores = Parallel(n_jobs=-1, prefer='threads')(
+        delayed(_ridge_one_alpha)(a, X_train, y_train, w_train, X_val, y_val, w_val)
+        for a in RIDGE_GRID['alpha']
+    )
     results = pd.DataFrame(scores)
     best_alpha = results.loc[results['val_weighted_r2'].idxmax(), 'alpha']
     model = Ridge(alpha=best_alpha, random_state=RANDOM_STATE)
@@ -71,29 +95,32 @@ def train_ridge(X_train, y_train, w_train, X_val, y_val, w_val):
 
 
 def train_random_forest(X_train, y_train, w_train, X_val, y_val, w_val):
-    """Train Random Forest with grid search over max_depth and min_samples_leaf.
+    """Train Random Forest with grid search over n_estimators, max_depth, and min_samples_leaf.
 
     Bootstrap size is capped at 80k rows per tree for speed.
+    Each fit uses n_jobs=-1 (built-in tree parallelism); grid search runs sequentially
+    to avoid memory-copy overhead of inter-process data transfer.
     Returns (fitted model, val weighted R², results DataFrame).
     """
     n_train = X_train.shape[0]
     max_samples = min(80_000, n_train)
     scores = []
-    for md in [5, 8]:
-        for ml in [10, 20]:
-            m = RandomForestRegressor(
-                n_estimators=35, max_depth=md, min_samples_leaf=ml,
-                max_samples=max_samples, random_state=RANDOM_STATE, n_jobs=-1,
-            )
-            m.fit(X_train, y_train, sample_weight=w_train)
-            scores.append({
-                'max_depth': md, 'min_samples_leaf': ml,
-                'val_weighted_r2': weighted_r2(y_val, m.predict(X_val), w_val),
-            })
+    for ne in RF_GRID['n_estimators']:
+        for md in RF_GRID['max_depth']:
+            for ml in RF_GRID['min_samples_leaf']:
+                m = RandomForestRegressor(
+                    n_estimators=ne, max_depth=md, min_samples_leaf=ml,
+                    max_samples=max_samples, random_state=RANDOM_STATE, n_jobs=-1,
+                )
+                m.fit(X_train, y_train, sample_weight=w_train)
+                scores.append({
+                    'n_estimators': ne, 'max_depth': md, 'min_samples_leaf': ml,
+                    'val_weighted_r2': weighted_r2(y_val, m.predict(X_val), w_val),
+                })
     results = pd.DataFrame(scores)
     best = results.loc[results['val_weighted_r2'].idxmax()]
     model = RandomForestRegressor(
-        n_estimators=80,
+        n_estimators=int(best['n_estimators']),
         max_depth=int(best['max_depth']),
         min_samples_leaf=int(best['min_samples_leaf']),
         max_samples=max_samples,
@@ -114,9 +141,9 @@ def train_xgboost(X_train, y_train, w_train, X_val, y_val, w_val):
     if not HAS_XGB:
         return None, np.nan, pd.DataFrame()
     scores = []
-    for md in [3, 4, 5, 6]:
-        for lr in [0.03, 0.05, 0.1]:
-            for ne in [100, 200]:
+    for md in XGB_GRID['max_depth']:
+        for lr in XGB_GRID['learning_rate']:
+            for ne in XGB_GRID['n_estimators']:
                 m = xgb.XGBRegressor(
                     n_estimators=ne, max_depth=md, learning_rate=lr,
                     random_state=RANDOM_STATE, n_jobs=-1,
@@ -140,6 +167,14 @@ def train_xgboost(X_train, y_train, w_train, X_val, y_val, w_val):
     return model, val_r2, results
 
 
+def _elasticnet_one_config(alpha, l1_ratio, Xt, yt, wt, X_val, y_val, w_val):
+    """Fit ElasticNet for one (alpha, l1_ratio) pair (used by joblib.Parallel)."""
+    m = ElasticNet(alpha=alpha, l1_ratio=l1_ratio, random_state=RANDOM_STATE)
+    m.fit(Xt, yt, sample_weight=wt)
+    return {'alpha': alpha, 'l1_ratio': l1_ratio,
+            'val_weighted_r2': weighted_r2(y_val, m.predict(X_val), w_val)}
+
+
 def train_elasticnet(X_train, y_train, w_train, X_val, y_val, w_val, tune_max_rows=100_000):
     """Train ElasticNet with grid search over alpha and l1_ratio.
 
@@ -154,17 +189,11 @@ def train_elasticnet(X_train, y_train, w_train, X_val, y_val, w_val, tune_max_ro
     else:
         Xt, yt, wt = X_train, y_train, w_train
 
-    alphas = np.logspace(-5, -0.5, 12)
-    l1_ratios = [0.8, 0.9, 0.95, 1.0]
-    scores = []
-    for alpha in alphas:
-        for l1 in l1_ratios:
-            m = ElasticNet(alpha=alpha, l1_ratio=l1, random_state=RANDOM_STATE)
-            m.fit(Xt, yt, sample_weight=wt)
-            scores.append({
-                'alpha': alpha, 'l1_ratio': l1,
-                'val_weighted_r2': weighted_r2(y_val, m.predict(X_val), w_val),
-            })
+    scores = Parallel(n_jobs=-1, prefer='processes')(
+        delayed(_elasticnet_one_config)(a, l1, Xt, yt, wt, X_val, y_val, w_val)
+        for a in ELASTICNET_GRID['alpha']
+        for l1 in ELASTICNET_GRID['l1_ratio']
+    )
     results = pd.DataFrame(scores)
     best = results.loc[results['val_weighted_r2'].idxmax()]
     model = ElasticNet(alpha=best['alpha'], l1_ratio=best['l1_ratio'], random_state=RANDOM_STATE)

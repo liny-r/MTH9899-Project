@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 
-from .utils import zscore_time_series_per_id, clip_cross_sectional_mad_per_date
+from .utils import zscore_time_series_per_id, winsorize_mad, zscore_cross_sectional
 from .data import build_daily_prev, INTRADAY_DIR
 
 
@@ -66,8 +66,9 @@ def add_target_pipeline(df, daily_all, prev_date):
       1. Merge EST_VOL_prev and MDV_63_prev from the previous trading day
       2. Target_vol_scaled = Target / EST_VOL_prev
       3. Target_ts         = TS z-score per Id (past-only, window=252, min=60)
-      4. Target_model      = cross-sectional ±5 MAD winsor of Target_ts
-      5. sample_weight     = sqrt(MDV_63_prev)
+      4. Target_mad        = cross-sectional ±5 MAD winsorization of Target_ts
+      5. Target_model      = cross-sectional z-score of Target_mad
+      6. sample_weight     = sqrt(MDV_63_prev)
 
     Also keeps Target_clip_cs5mad (raw target clipped at ±5 MAD CS) for diagnostics.
 
@@ -88,8 +89,9 @@ def add_target_pipeline(df, daily_all, prev_date):
 
     df['Target_vol_scaled'] = df['Target'] / df['EST_VOL_prev']
     df['Target_ts'] = zscore_time_series_per_id(df, 'Target_vol_scaled')
-    df['Target_model'] = clip_cross_sectional_mad_per_date(df, 'Target_ts')
-    df['Target_clip_cs5mad'] = clip_cross_sectional_mad_per_date(df, 'Target')
+    df['Target_mad'] = winsorize_mad(df, 'Target_ts')
+    df['Target_model'] = zscore_cross_sectional(df, 'Target_mad')
+    df['Target_clip_cs5mad'] = winsorize_mad(df, 'Target')
     df['sample_weight'] = np.sqrt(df['MDV_63_prev'].replace(0, np.nan))
 
     df = df.dropna(subset=['Target_model', 'sample_weight'])

@@ -40,19 +40,6 @@ def zscore_time_series_per_id(
     return pd.Series(work['_zts'].to_numpy(), index=df.index)
 
 
-def clip_cross_sectional_mad_per_date(df, col, date_col='Date', n_mad=5.0):
-    """Per trading date: clip values to median ± n_mad * MAD (cross-section)."""
-
-    def _clip(g):
-        med = g.median()
-        mad = (g - med).abs().median()
-        if not np.isfinite(mad) or mad == 0:
-            return g
-        return g.clip(lower=med - n_mad * mad, upper=med + n_mad * mad)
-
-    return df.groupby(date_col, sort=False)[col].transform(_clip)
-
-
 def winsorize_mad(df, col, n_mad=5):
     """Winsorize at ±n_mad * MAD cross-sectionally per date."""
     mad = df.groupby('Date')[col].transform(
@@ -79,6 +66,6 @@ def zscore_cross_sectional(df, col):
     )
 
 
-def weighted_r2(y_true, y_pred, sample_weight):
+def weighted_r2(y_true, y_pred, weight):
     """Weighted R² as per spec: weights = sqrt(MDV_63) for evaluation."""
-    return r2_score(y_true, y_pred, sample_weight=sample_weight)
+    return r2_score(y_true, y_pred, weight=weight)

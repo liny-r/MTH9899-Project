@@ -5,7 +5,7 @@ import pandas as pd
 
 from .utils import (
     TS_WINDOW, TS_MIN_PERIODS,
-    zscore_time_series_per_id, winsorize_mad, zscore_cross_sectional,
+    zscore_time_series_per_id, winsorize_mad, winsorize_percentile, zscore_cross_sectional,
 )
 from .data import load_day_pivoted, build_daily_prev, INTRADAY_DIR
 
@@ -134,6 +134,13 @@ def build_daily_features(feat_df, daily_all, date_list, prev_date):
 
     Returns feat_df with these three columns merged in.
     """
+    # Pre-index daily data by date to avoid O(N) scans per lookup
+    daily_by_date = {
+        d: grp.set_index('Id')[['Close_adj', 'DollarVol', 'MDV_63']]
+        for d, grp in daily_all.groupby('Date')
+    }
+    date_to_idx = {d: i for i, d in enumerate(date_list)}
+
     rows = []
     for D in feat_df['Date'].unique():
         if D not in prev_date:
@@ -142,41 +149,35 @@ def build_daily_features(feat_df, daily_all, date_list, prev_date):
         D_prev2 = prev_date.get(D_prev)
         if D_prev2 is None:
             continue
-        idx = date_list.index(D)
-        if idx < 23:
+        idx = date_to_idx.get(D)
+        if idx is None or idx < 23:
             continue
         D_prev23 = date_list[idx - 23]  # 21 trading days before D_prev (at idx-2)
 
-        d1 = (
-            daily_all[daily_all['Date'] == D_prev][['Id', 'Close_adj', 'DollarVol', 'MDV_63']]
-            .rename(columns={'Close_adj': 'c1', 'DollarVol': 'dv1', 'MDV_63': 'MDV_63_1'})
-        )
-        d2 = (
-            daily_all[daily_all['Date'] == D_prev2][['Id', 'Close_adj']]
-            .rename(columns={'Close_adj': 'c2'})
-        )
-        d23 = (
-            daily_all[daily_all['Date'] == D_prev23][['Id', 'Close_adj']]
-            .rename(columns={'Close_adj': 'c23'})
-        )
-        m = d1.merge(d2, on='Id', how='inner').merge(d23, on='Id', how='inner')
+        if D_prev not in daily_by_date or D_prev2 not in daily_by_date or D_prev23 not in daily_by_date:
+            continue
+
+        d1  = daily_by_date[D_prev][['Close_adj', 'DollarVol', 'MDV_63']].rename(
+            columns={'Close_adj': 'c1', 'DollarVol': 'dv1', 'MDV_63': 'MDV_63_1'})
+        d2  = daily_by_date[D_prev2][['Close_adj']].rename(columns={'Close_adj': 'c2'})
+        d23 = daily_by_date[D_prev23][['Close_adj']].rename(columns={'Close_adj': 'c23'})
+
+        m = d1.join(d2, how='inner').join(d23, how='inner').reset_index()
         m['ShortTermReversal'] = (m['c1'] / m['c2']) - 1
-        m['Momentum21d'] = (m['c2'] / m['c23']) - 1
+        m['Momentum21d']       = (m['c2'] / m['c23']) - 1
 
         # 5-day average dollar volume trend
+        dv_cols = {}
         d_ = D_prev
-        dv_list = []
-        for _ in range(5):
-            if d_ is None:
+        for i in range(5):
+            if d_ is None or d_ not in daily_by_date:
                 break
-            dv_list.append(daily_all[daily_all['Date'] == d_][['Id', 'DollarVol']])
+            dv_cols[f'v{i}'] = daily_by_date[d_]['DollarVol']
             d_ = prev_date.get(d_)
-        if len(dv_list) == 5:
-            dv_5d = dv_list[0].rename(columns={'DollarVol': 'v0'})
-            for i, df in enumerate(dv_list[1:], 1):
-                dv_5d = dv_5d.merge(df.rename(columns={'DollarVol': f'v{i}'}), on='Id', how='outer')
-            dv_5d['avg_dv_5d'] = dv_5d[['v0', 'v1', 'v2', 'v3', 'v4']].mean(axis=1)
-            m = m.merge(dv_5d[['Id', 'avg_dv_5d']], on='Id', how='left')
+
+        if len(dv_cols) == 5:
+            dv_5d = pd.concat(dv_cols, axis=1)  # index=Id, columns=v0..v4
+            m = m.join(dv_5d.mean(axis=1).rename('avg_dv_5d'), on='Id', how='left')
             m['DollarVolTrend'] = m['avg_dv_5d'] / m['MDV_63_1'].replace(0, np.nan)
         else:
             m['DollarVolTrend'] = np.nan
@@ -235,7 +236,12 @@ def normalize_features(feat_df):
 
     for col in raw_cols:
         feat_df[f'{col}_ts'] = zscore_time_series_per_id(feat_df, col)
-        feat_df[f'{col}_w'] = winsorize_mad(feat_df, f'{col}_ts', n_mad=5)
+        if col in PCT_FEATURES:
+            feat_df[f'{col}_w'] = winsorize_percentile(feat_df, f'{col}_ts')
+        elif col in NO_WINSOR_FEATURES:
+            feat_df[f'{col}_w'] = feat_df[f'{col}_ts']
+        else:  # MAD_FEATURES
+            feat_df[f'{col}_w'] = winsorize_mad(feat_df, f'{col}_ts', n_mad=5)
         feat_df[f'{col}_norm'] = zscore_cross_sectional(feat_df, f'{col}_w')
 
     # Drop intermediate columns
