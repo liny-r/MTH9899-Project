@@ -22,10 +22,13 @@ TIME_1530 = '15:30'
 MAD_FEATURES = [
     'OvernightReturn', 'FirstHourMomentum', 'LastHourMomentum', 'IntradayReversal',
     'IntradayReturnSkew', 'VolatilityAdjustedReturn',
-    'ShortTermReversal', 'Momentum21d', 'DollarVolTrend',
+    'ShortTermReversal', 'Momentum21d', 'Momentum5d', 'DollarVolTrend',
 ]
 # Features using 1st–99th percentile winsorization (ratio/volume, right-skewed)
-PCT_FEATURES = ['RealizedUpsideVol', 'VolumeSurprise', 'VolumeMorningAfternoonRatio']
+PCT_FEATURES = [
+    'RealizedUpsideVol', 'IntradayVol',
+    'VolumeSurprise', 'VolumeMorningAfternoonRatio', 'IntradayVolAccel',
+]
 # Features with no winsorization (bounded by construction)
 NO_WINSOR_FEATURES = ['RetVolCorr']
 
@@ -85,6 +88,8 @@ def features_single_day(r, v, date_int):
         up_sq = np.where(arr > 0, arr * arr, np.nan)
         with np.errstate(all='ignore'):
             out['RealizedUpsideVol'] = np.sqrt(np.nanmean(up_sq, axis=1))
+        # Symmetric intraday volatility (std of all 15-min increments, not just upside)
+        out['IntradayVol'] = ret_inc.std(axis=1).values
 
     # Volume snapshot columns (MDV_63 scaling applied later after daily merge)
     if v is not None:
@@ -143,6 +148,8 @@ def _daily_one_date(D, daily_by_date, prev_date, date_to_idx, date_list):
     if idx is None or idx < 23:
         return None
     D_prev23 = date_list[idx - 23]
+    # Momentum5d: Close(t-2) / Close(t-7) - 1; t-7 is 5 days before t-2
+    D_prev7  = date_list[idx - 7] if idx >= 7 else None
 
     if D_prev not in daily_by_date or D_prev2 not in daily_by_date or D_prev23 not in daily_by_date:
         return None
@@ -155,6 +162,13 @@ def _daily_one_date(D, daily_by_date, prev_date, date_to_idx, date_list):
     m = d1.join(d2, how='inner').join(d23, how='inner').reset_index()
     m['ShortTermReversal'] = (m['c1'] / m['c2']) - 1
     m['Momentum21d']       = (m['c2'] / m['c23']) - 1
+
+    if D_prev7 is not None and D_prev7 in daily_by_date:
+        d7 = daily_by_date[D_prev7][['Close_adj']].rename(columns={'Close_adj': 'c7'})
+        m = m.join(d7, on='Id', how='left')
+        m['Momentum5d'] = (m['c2'] / m['c7'].replace(0, np.nan)) - 1
+    else:
+        m['Momentum5d'] = np.nan
 
     dv_cols = {}
     d_ = D_prev
@@ -171,7 +185,7 @@ def _daily_one_date(D, daily_by_date, prev_date, date_to_idx, date_list):
     else:
         m['DollarVolTrend'] = np.nan
 
-    m = m[['Id', 'ShortTermReversal', 'Momentum21d', 'DollarVolTrend']].copy()
+    m = m[['Id', 'ShortTermReversal', 'Momentum21d', 'Momentum5d', 'DollarVolTrend']].copy()
     m['Date'] = D
     return m
 
@@ -182,6 +196,7 @@ def build_daily_features(feat_df, daily_all, date_list, prev_date):
     Features computed (all use data from dates strictly before D):
       - ShortTermReversal: Close_adj(t-1) / Close_adj(t-2) - 1
       - Momentum21d:       Close_adj(t-2) / Close_adj(t-23) - 1  (skips t-1)
+      - Momentum5d:        Close_adj(t-2) / Close_adj(t-7)  - 1  (skips t-1)
       - DollarVolTrend:    mean(DollarVol, t-1..t-5) / MDV_63(t-1)
 
     Returns feat_df with these three columns merged in.
@@ -232,6 +247,11 @@ def attach_daily_prev(feat_df, daily_all, prev_date):
     feat_df['VolatilityAdjustedReturn'] = (
         feat_df['CumReturnResid_1530'] / feat_df['EST_VOL_prev'].replace(0, np.nan)
     )
+    # Afternoon-to-morning volume acceleration (ratio of cum volume at 15:30 vs 12:00)
+    if 'CumVolume_1200' in feat_df.columns and 'CumVolume_1530' in feat_df.columns:
+        feat_df['IntradayVolAccel'] = (
+            feat_df['CumVolume_1530'] / feat_df['CumVolume_1200'].replace(0, np.nan)
+        )
     return feat_df
 
 

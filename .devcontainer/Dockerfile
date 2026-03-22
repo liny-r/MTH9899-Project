@@ -15,7 +15,8 @@ RUN npm install -g @anthropic-ai/claude-code
 # Install firewall tools for docker devcontainer
 RUN apt-get install -y tinyproxy 
 
-# Needed for firewall 
+# tmux allows terminals to run when computer is sleeping
+RUN apt-get update && apt-get install -y tmux
 
 # Install Python packages
 RUN apt-get install -y python3-pip python3-venv 
