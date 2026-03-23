@@ -37,3 +37,10 @@ RUN pip3 install --break-system-packages \
 # Copy and enable firewall script for non-docker
 # COPY init-firewall.sh /usr/local/bin/init-firewall.sh
 # RUN chmod +x /usr/local/bin/init-firewall.sh
+
+# Allocating swap space for the project after an OOM kernel death
+RUN fallocate -l 4G /swapfile && \
+    chmod 600 /swapfile && \
+    mkswap /swapfile
+
+RUN echo 'ALL ALL=(ALL) NOPASSWD: /sbin/swapon' >> /etc/sudoers.d/swapfile

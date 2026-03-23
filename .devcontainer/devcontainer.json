@@ -12,7 +12,7 @@
   "containerEnv": {
     "CLAUDE_CONFIG_DIR": "/home/vscode/.claude"
   },
-  "postStartCommand": "sudo /bin/bash .devcontainer/init-proxy.sh",
+  "postStartCommand": "sudo /bin/bash .devcontainer/init-proxy.sh && (sudo swapon /swapfile || true)",
   "postCreateCommand": "pip install -r requirements.txt --break-system-packages",
   "remoteUser": "vscode",
   "features": {

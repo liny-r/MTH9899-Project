@@ -3,7 +3,7 @@
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from tqdm.auto import tqdm
+from tqdm import tqdm
 from joblib import Parallel, delayed
 
 from .utils import zscore_time_series_per_id, winsorize_mad, zscore_cross_sectional

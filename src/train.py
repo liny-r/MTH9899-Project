@@ -12,7 +12,7 @@ from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
 from itertools import product
 from joblib import Parallel, delayed
-from tqdm.auto import tqdm
+from tqdm import tqdm
 
 from .utils import weighted_r2
 
@@ -35,10 +35,17 @@ RF_GRID = {
     'min_samples_leaf': [10, 20],
 }
 XGB_GRID = {
-    'max_depth':     [3, 4, 5, 6],
-    'learning_rate': [0.03, 0.05, 0.1],
-    'n_estimators':  [100, 200, 300],
+    'max_depth':        [3, 5],
+    'learning_rate':    [0.03, 0.1],
+    'n_estimators':     [80, 150],
+    'subsample':        [0.8, 1.0],
+    'colsample_bytree': [0.8, 1.0],
+    'min_child_weight': [10, 50],
 }
+# 2-level full factorial: 2^6 = 64 configs.
+# All 6 dimensions explored at low/high values — identical grid on every
+# walk-forward fold so R² comparisons are not confounded by search budget.
+
 ELASTICNET_GRID = {
     'alpha':    np.logspace(-5, -0.5, 12).tolist(),
     'l1_ratio': [0.1, 0.5, 0.8, 0.9, 0.95, 1.0],
@@ -133,7 +140,7 @@ def train_random_forest(X_train, y_train, w_train, X_val, y_val, w_val):
 
 
 def train_xgboost(X_train, y_train, w_train, X_val, y_val, w_val):
-    """Train XGBoost with grid search over max_depth, learning_rate, n_estimators.
+    """Train XGBoost with grid search over all XGB_GRID dimensions.
 
     Returns (fitted model, val weighted R², results DataFrame).
     Returns (None, nan, empty DataFrame) if XGBoost is not installed.
@@ -141,15 +148,20 @@ def train_xgboost(X_train, y_train, w_train, X_val, y_val, w_val):
     if not HAS_XGB:
         return None, np.nan, pd.DataFrame()
     scores = []
-    xgb_configs = list(product(XGB_GRID['max_depth'], XGB_GRID['learning_rate'], XGB_GRID['n_estimators']))
-    for md, lr, ne in tqdm(xgb_configs, desc='XGB grid search'):
+    xgb_configs = list(product(
+        XGB_GRID['max_depth'], XGB_GRID['learning_rate'], XGB_GRID['n_estimators'],
+        XGB_GRID['subsample'], XGB_GRID['colsample_bytree'], XGB_GRID['min_child_weight'],
+    ))
+    for md, lr, ne, sub, col, mcw in tqdm(xgb_configs, desc='XGB grid search'):
         m = xgb.XGBRegressor(
             n_estimators=ne, max_depth=md, learning_rate=lr,
+            subsample=sub, colsample_bytree=col, min_child_weight=mcw,
             random_state=RANDOM_STATE, n_jobs=-1,
         )
         m.fit(X_train, y_train, sample_weight=w_train)
         scores.append({
             'max_depth': md, 'learning_rate': lr, 'n_estimators': ne,
+            'subsample': sub, 'colsample_bytree': col, 'min_child_weight': mcw,
             'val_weighted_r2': weighted_r2(y_val, m.predict(X_val), w_val),
         })
     results = pd.DataFrame(scores)
@@ -158,6 +170,9 @@ def train_xgboost(X_train, y_train, w_train, X_val, y_val, w_val):
         n_estimators=int(best['n_estimators']),
         max_depth=int(best['max_depth']),
         learning_rate=best['learning_rate'],
+        subsample=float(best['subsample']),
+        colsample_bytree=float(best['colsample_bytree']),
+        min_child_weight=int(best['min_child_weight']),
         random_state=RANDOM_STATE,
         n_jobs=-1,
     )
@@ -320,3 +335,117 @@ def save_artifacts(model_dir, best_model, feature_cols, scaler, fit_target_mode=
     with open(model_dir / 'fit_target_mode.pkl', 'wb') as f:
         pickle.dump(fit_target_mode, f)
     print(f'Saved model artifacts to {model_dir}/')
+
+
+def walk_forward_cv(merged_df, feature_cols):
+    """Walk-forward cross-validation with expanding training window.
+
+    Trains all 5 models with full hyperparameter grids on each fold.
+    Fold structure (expanding window):
+        Fold 1: train=2010,          val=2011
+        Fold 2: train=2010-2011,     val=2012
+        Fold 3: train=2010-2012,     val=2013
+        Fold 4: train=2010-2013,     val=2014  ← final fold (replaces train_all_models)
+
+    The final fold's fitted models, scores, results, and scaler are returned
+    separately so that downstream cells (best-model selection, ensemble,
+    overfitting analysis, white paper) can use them directly — no separate
+    train_all_models call is needed.
+
+    Args:
+        merged_df:    DataFrame with 'Year' column plus feature_cols, Target_model,
+                      and sample_weight. Must span at least 2010-2014.
+        feature_cols: ordered list of feature column names.
+
+    Returns:
+        wf_results:    DataFrame with columns [fold, train_years, val_year, model, val_r2]
+        final_models:  dict of name -> fitted model  (Fold 4)
+        final_scores:  dict of name -> val weighted R²  (Fold 4)
+        final_results: dict of name -> hyperparameter search DataFrame  (Fold 4)
+        final_scaler:  StandardScaler fitted on Fold 4 training data
+    """
+    folds = [
+        ([2010],                2011),
+        ([2010, 2011],          2012),
+        ([2010, 2011, 2012],    2013),
+        ([2010, 2011, 2012, 2013], 2014),
+    ]
+    all_rows = []
+    final_models = final_scores = final_results = final_scaler = None
+
+    for train_years, val_year in folds:
+        fold_label = f"{train_years[0]}-{train_years[-1]} → {val_year}"
+        print(f'\n--- Fold: {fold_label} ---')
+        tr = merged_df[merged_df['Year'].isin(train_years)].copy()
+        va = merged_df[merged_df['Year'] == val_year].copy()
+        if len(tr) == 0 or len(va) == 0:
+            print(f'  Skipping fold {fold_label}: empty train or val.')
+            continue
+
+        X_tr, y_tr, w_tr, X_va, y_va, w_va, scaler = prepare_matrices(tr, va, feature_cols)
+
+        fold_models, fold_scores, fold_results = train_all_models(
+            X_tr, y_tr, w_tr, X_va, y_va, w_va
+        )
+
+        for model_name, r2 in fold_scores.items():
+            all_rows.append({
+                'fold':        fold_label,
+                'train_years': f"{train_years[0]}-{train_years[-1]}",
+                'val_year':    val_year,
+                'model':       model_name,
+                'val_r2':      r2,
+            })
+
+        # Capture the final fold's artifacts for downstream use
+        if val_year == 2014:
+            final_models  = fold_models
+            final_scores  = fold_scores
+            final_results = fold_results
+            final_scaler  = scaler
+
+    return pd.DataFrame(all_rows), final_models, final_scores, final_results, final_scaler
+
+
+def train_ensemble(models, scores, X_val, y_val, w_val):
+    """Blend XGBoost and Ridge predictions via two weighting schemes.
+
+    Evaluates:
+        - Equal-weight blend:   0.5 * XGB + 0.5 * Ridge
+        - Val-R²-weighted blend: R2_xgb/(R2_xgb+R2_ridge) * XGB + ...
+
+    Args:
+        models: dict of name -> fitted model (must contain 'XGBoost' and 'Ridge')
+        scores: dict of name -> val weighted R²
+        X_val, y_val, w_val: validation arrays
+
+    Returns:
+        ensemble_preds: dict of blend_name -> np.ndarray of val predictions
+        ensemble_r2:    dict of blend_name -> val weighted R²
+        best_blend:     name of the best-performing blend
+        best_preds:     prediction array for the best blend
+    """
+    xgb_pred   = models['XGBoost'].predict(X_val)
+    ridge_pred = models['Ridge'].predict(X_val)
+
+    r2_xgb   = scores['XGBoost']
+    r2_ridge = scores['Ridge']
+
+    # Equal-weight blend
+    equal_preds = 0.5 * xgb_pred + 0.5 * ridge_pred
+
+    # Val-R²-weighted blend
+    total = r2_xgb + r2_ridge
+    w_xgb   = r2_xgb   / total
+    w_ridge = r2_ridge / total
+    weighted_preds = w_xgb * xgb_pred + w_ridge * ridge_pred
+
+    ensemble_preds = {
+        'XGB+Ridge (equal)':    equal_preds,
+        'XGB+Ridge (R²-wtd)':   weighted_preds,
+    }
+    ensemble_r2 = {name: weighted_r2(y_val, p, w_val) for name, p in ensemble_preds.items()}
+
+    best_blend = max(ensemble_r2, key=ensemble_r2.__getitem__)
+    best_preds = ensemble_preds[best_blend]
+    return ensemble_preds, ensemble_r2, best_blend, best_preds
