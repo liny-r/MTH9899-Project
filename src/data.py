@@ -68,20 +68,30 @@ def load_day_pivoted(date_str, intraday_dir=INTRADAY_DIR):
 
 
 def build_daily_prev(daily_all, dates, prev_date):
-    """Build a DataFrame with previous-day EST_VOL and MDV_63 for a set of dates.
+    """Build a DataFrame with previous-day EST_VOL, MDV_63, Close_adj, and SharesAdjFactor.
 
     At 15:30 on day D, same-day daily data is not yet available, so we use
     the prior trading day's values.
 
-    Returns DataFrame with columns: Date, Id, EST_VOL_prev, MDV_63_prev
+    Returns DataFrame with columns:
+        Date, Id, EST_VOL_prev, MDV_63_prev, Close_adj_prev, SharesAdjFactor_prev
     """
     rows = []
     for D in dates:
         D_prev = prev_date.get(D)
         if D_prev is None:
             continue
-        d = daily_all[daily_all['Date'] == D_prev][['Id', 'EST_VOL', 'MDV_63']].copy()
-        d = d.rename(columns={'EST_VOL': 'EST_VOL_prev', 'MDV_63': 'MDV_63_prev'})
+        available = ['Id', 'EST_VOL', 'MDV_63']
+        for col in ('Close_adj', 'SharesAdjFactor'):
+            if col in daily_all.columns:
+                available.append(col)
+        d = daily_all[daily_all['Date'] == D_prev][available].copy()
+        d = d.rename(columns={
+            'EST_VOL':         'EST_VOL_prev',
+            'MDV_63':          'MDV_63_prev',
+            'Close_adj':       'Close_adj_prev',
+            'SharesAdjFactor': 'SharesAdjFactor_prev',
+        })
         d['Date'] = D
         rows.append(d)
     return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()

@@ -315,6 +315,126 @@ def train_all_models(X_train, y_train, w_train, X_val, y_val, w_val):
     return models, scores, results
 
 
+def extract_best_hyperparams(results):
+    """Extract the best hyperparameter config per model from grid search results.
+
+    Args:
+        results: dict of model_name -> hyperparameter search DataFrame
+                 (each DataFrame has a 'val_weighted_r2' column)
+
+    Returns:
+        dict of model_name -> dict of best hyperparameter values (val_weighted_r2 excluded)
+    """
+    best = {}
+    for name, df in results.items():
+        if df is None or (hasattr(df, 'empty') and df.empty):
+            best[name] = {}
+            continue
+        best_row = df.loc[df['val_weighted_r2'].idxmax()]
+        best[name] = {k: v for k, v in best_row.items()
+                      if k not in ('val_weighted_r2', 'n_iter')}
+    return best
+
+
+def train_all_models_fixed(hyperparams, X_train, y_train, w_train, X_val, y_val, w_val):
+    """Fit all models with fixed hyperparameters — no grid search.
+
+    Used for the final fold so 2014 val is a clean holdout (hyperparameters were
+    selected on Fold 3's 2013 val, not on 2014).
+
+    Args:
+        hyperparams: dict of model_name -> dict of hyperparameter values,
+                     as returned by extract_best_hyperparams().
+        X_train, y_train, w_train: training arrays
+        X_val, y_val, w_val: validation arrays (evaluated but NOT used for selection)
+
+    Returns:
+        models: dict of name -> fitted model
+        scores: dict of name -> val weighted R²
+    """
+    models, scores = {}, {}
+    n_train = X_train.shape[0]
+
+    # Ridge
+    h = hyperparams.get('Ridge', {})
+    m = Ridge(alpha=float(h.get('alpha', 1.0)), random_state=RANDOM_STATE)
+    m.fit(X_train, y_train, sample_weight=w_train)
+    models['Ridge'] = m
+    scores['Ridge'] = weighted_r2(y_val, m.predict(X_val), w_val)
+    print(f'  Ridge (fixed α={h.get("alpha", 1.0):.4g}) val weighted R² = {scores["Ridge"]:.6f}')
+
+    # Random Forest
+    h = hyperparams.get('Random Forest', {})
+    m = RandomForestRegressor(
+        n_estimators=int(h.get('n_estimators', 80)),
+        max_depth=int(h.get('max_depth', 5)),
+        min_samples_leaf=int(h.get('min_samples_leaf', 10)),
+        max_samples=min(80_000, n_train),
+        random_state=RANDOM_STATE, n_jobs=-1,
+    )
+    m.fit(X_train, y_train, sample_weight=w_train)
+    models['Random Forest'] = m
+    scores['Random Forest'] = weighted_r2(y_val, m.predict(X_val), w_val)
+    print(f'  Random Forest (fixed) val weighted R² = {scores["Random Forest"]:.6f}')
+
+    # XGBoost
+    if HAS_XGB:
+        h = hyperparams.get('XGBoost', {})
+        m = xgb.XGBRegressor(
+            n_estimators=int(h.get('n_estimators', 100)),
+            max_depth=int(h.get('max_depth', 3)),
+            learning_rate=float(h.get('learning_rate', 0.05)),
+            subsample=float(h.get('subsample', 0.8)),
+            colsample_bytree=float(h.get('colsample_bytree', 0.8)),
+            min_child_weight=int(h.get('min_child_weight', 10)),
+            random_state=RANDOM_STATE, n_jobs=-1,
+        )
+        m.fit(X_train, y_train, sample_weight=w_train)
+        models['XGBoost'] = m
+        scores['XGBoost'] = weighted_r2(y_val, m.predict(X_val), w_val)
+        print(f'  XGBoost (fixed) val weighted R² = {scores["XGBoost"]:.6f}')
+    else:
+        models['XGBoost'] = None
+        scores['XGBoost'] = np.nan
+
+    # ElasticNet
+    h = hyperparams.get('ElasticNet', {})
+    m = ElasticNet(
+        alpha=float(h.get('alpha', 1e-3)),
+        l1_ratio=float(h.get('l1_ratio', 0.9)),
+        random_state=RANDOM_STATE,
+    )
+    m.fit(X_train, y_train, sample_weight=w_train)
+    models['ElasticNet'] = m
+    scores['ElasticNet'] = weighted_r2(y_val, m.predict(X_val), w_val)
+    print(f'  ElasticNet (fixed) val weighted R² = {scores["ElasticNet"]:.6f}')
+
+    # MLP — hidden_layer_sizes may be stored as a tuple or string
+    h = hyperparams.get('MLP', {})
+    hidden = h.get('hidden_layer_sizes', (128,))
+    if isinstance(hidden, str):
+        hidden = tuple(int(x) for x in hidden.strip('()').split(',') if x.strip())
+    m = MLPRegressor(
+        hidden_layer_sizes=hidden,
+        alpha=float(h.get('alpha', 1e-3)),
+        activation='relu', solver='adam',
+        learning_rate='adaptive',
+        learning_rate_init=float(h.get('learning_rate_init', 1e-3)),
+        max_iter=800, early_stopping=True, validation_fraction=0.1,
+        n_iter_no_change=25, tol=1e-4, random_state=RANDOM_STATE,
+        batch_size=1024,
+    )
+    try:
+        m.fit(X_train, y_train, sample_weight=w_train)
+    except TypeError:
+        m.fit(X_train, y_train)
+    models['MLP'] = m
+    scores['MLP'] = weighted_r2(y_val, m.predict(X_val), w_val)
+    print(f'  MLP (fixed) val weighted R² = {scores["MLP"]:.6f}')
+
+    return models, scores
+
+
 def select_best_model(models, scores):
     """Return (best_name, best_model) based on highest val weighted R²."""
     valid = {k: v for k, v in scores.items() if np.isfinite(v) and models.get(k) is not None}
@@ -372,6 +492,9 @@ def walk_forward_cv(merged_df, feature_cols):
     ]
     all_rows = []
     final_models = final_scores = final_results = final_scaler = None
+    # Best hyperparameters from the most recently completed non-final fold (Fold 3).
+    # Used for the final fold so 2014 val is never touched during grid search.
+    prev_hyperparams = None
 
     for train_years, val_year in folds:
         fold_label = f"{train_years[0]}-{train_years[-1]} → {val_year}"
@@ -384,9 +507,21 @@ def walk_forward_cv(merged_df, feature_cols):
 
         X_tr, y_tr, w_tr, X_va, y_va, w_va, scaler = prepare_matrices(tr, va, feature_cols)
 
-        fold_models, fold_scores, fold_results = train_all_models(
-            X_tr, y_tr, w_tr, X_va, y_va, w_va
-        )
+        if val_year == 2014 and prev_hyperparams is not None:
+            # Final fold: freeze hyperparameters from Fold 3 (val=2013).
+            # No grid search touches 2014 — it remains a clean holdout.
+            print('  [Final fold] Hyperparameters frozen from Fold 3 (val=2013).')
+            print('  No grid search on 2014 — reported R² is uncontaminated.')
+            fold_models, fold_scores = train_all_models_fixed(
+                prev_hyperparams, X_tr, y_tr, w_tr, X_va, y_va, w_va
+            )
+            fold_results = {}  # No grid search DataFrames for this fold
+        else:
+            fold_models, fold_scores, fold_results = train_all_models(
+                X_tr, y_tr, w_tr, X_va, y_va, w_va
+            )
+            # Save hyperparameters for the next (final) fold
+            prev_hyperparams = extract_best_hyperparams(fold_results)
 
         for model_name, r2 in fold_scores.items():
             all_rows.append({
@@ -407,7 +542,7 @@ def walk_forward_cv(merged_df, feature_cols):
     return pd.DataFrame(all_rows), final_models, final_scores, final_results, final_scaler
 
 
-def train_ensemble(models, scores, X_val, y_val, w_val):
+def train_ensemble(models, scores, X_val, y_val, w_val, prior_scores=None):
     """Blend XGBoost and Ridge predictions via two weighting schemes.
 
     Evaluates:
@@ -416,8 +551,13 @@ def train_ensemble(models, scores, X_val, y_val, w_val):
 
     Args:
         models: dict of name -> fitted model (must contain 'XGBoost' and 'Ridge')
-        scores: dict of name -> val weighted R²
+        scores: dict of name -> val weighted R² (used only for R²-weighted blend
+                when prior_scores is None)
         X_val, y_val, w_val: validation arrays
+        prior_scores: optional dict of name -> val weighted R² from a *prior* fold
+                      (e.g. Fold 3 scores on 2013 val). When provided, the
+                      R²-weighted blend derives its weights from these instead of
+                      from scores, so 2014 val is not used to set blend weights.
 
     Returns:
         ensemble_preds: dict of blend_name -> np.ndarray of val predictions
@@ -428,16 +568,20 @@ def train_ensemble(models, scores, X_val, y_val, w_val):
     xgb_pred   = models['XGBoost'].predict(X_val)
     ridge_pred = models['Ridge'].predict(X_val)
 
-    r2_xgb   = scores['XGBoost']
-    r2_ridge = scores['Ridge']
-
     # Equal-weight blend
     equal_preds = 0.5 * xgb_pred + 0.5 * ridge_pred
 
-    # Val-R²-weighted blend
-    total = r2_xgb + r2_ridge
-    w_xgb   = r2_xgb   / total
-    w_ridge = r2_ridge / total
+    # R²-weighted blend: use prior_scores if supplied to avoid 2014 contamination.
+    # Clip negative R²s to 0 so weights stay in [0, 1] and sum to 1.
+    weight_source = prior_scores if prior_scores is not None else scores
+    r2_xgb_w   = max(float(weight_source.get('XGBoost', scores.get('XGBoost', 0))), 0.0)
+    r2_ridge_w  = max(float(weight_source.get('Ridge',   scores.get('Ridge',   0))), 0.0)
+    total = r2_xgb_w + r2_ridge_w
+    if total <= 0:
+        w_xgb = w_ridge = 0.5   # fallback: both models non-positive → equal weight
+    else:
+        w_xgb   = r2_xgb_w   / total
+        w_ridge = r2_ridge_w / total
     weighted_preds = w_xgb * xgb_pred + w_ridge * ridge_pred
 
     ensemble_preds = {

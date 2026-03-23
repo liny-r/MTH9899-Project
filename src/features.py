@@ -236,9 +236,21 @@ def attach_daily_prev(feat_df, daily_all, prev_date):
     daily_prev = build_daily_prev(daily_all, feat_df['Date'].unique(), prev_date)
     feat_df = feat_df.merge(daily_prev, on=['Date', 'Id'], how='left')
 
-    feat_df['VolumeSurprise'] = (
-        feat_df['CumVolume_1530'] / feat_df['MDV_63_prev'].replace(0, np.nan)
-    )
+    # CumVolume (intraday) is in shares; MDV_63_prev is in dollars.
+    # Convert to dollar volume using previous day's price before dividing.
+    # DollarVol formula: shares × SharesAdjFactor × Close_adj (matches daily DollarVol).
+    if 'Close_adj_prev' in feat_df.columns and 'SharesAdjFactor_prev' in feat_df.columns:
+        _cum_dollar_vol = (
+            feat_df['CumVolume_1530']
+            * feat_df['SharesAdjFactor_prev'].replace(0, np.nan)
+            * feat_df['Close_adj_prev'].replace(0, np.nan)
+        )
+        feat_df['VolumeSurprise'] = _cum_dollar_vol / feat_df['MDV_63_prev'].replace(0, np.nan)
+    else:
+        # Fallback when price columns are unavailable (e.g. unit tests with minimal fixtures)
+        feat_df['VolumeSurprise'] = (
+            feat_df['CumVolume_1530'] / feat_df['MDV_63_prev'].replace(0, np.nan)
+        )
     if 'CumVolume_0945' in feat_df.columns and 'CumVolume_1200' in feat_df.columns:
         _vm = feat_df['CumVolume_1200'] - feat_df['CumVolume_0945']
         _va = feat_df['CumVolume_1530'] - feat_df['CumVolume_1200']

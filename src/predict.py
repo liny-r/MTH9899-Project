@@ -38,15 +38,21 @@ def load_artifacts(model_dir=MODEL_DIR):
     return model, feature_cols, scaler, fit_target_mode
 
 
-def predict(df, model_dir=MODEL_DIR):
+def predict(df, model_dir=MODEL_DIR, rescale_to_return_space=False):
     """Generate predictions on a new feature DataFrame.
 
     Args:
-        df:        DataFrame containing at minimum the feature columns.
-        model_dir: path to the directory containing saved .pkl files.
+        df:                      DataFrame containing at minimum the feature columns.
+        model_dir:               path to the directory containing saved .pkl files.
+        rescale_to_return_space: if True, multiply normalised predictions by
+                                 df['EST_VOL_prev'] to convert back to return space,
+                                 as required by the project assignment for holdout
+                                 test submission.  Requires 'EST_VOL_prev' in df.
+                                 Default False (keeps predictions in Target_model space
+                                 for R² evaluation and bias analysis).
 
     Returns:
-        np.ndarray of predictions in Target_model space.
+        np.ndarray of predictions in Target_model space (default) or return space.
         Uses ensemble (XGB+Ridge blend) if ensemble artifacts exist,
         otherwise uses best_model.pkl.
     """
@@ -57,8 +63,14 @@ def predict(df, model_dir=MODEL_DIR):
     X = scaler.transform(df[feature_cols].astype(float))
 
     if isinstance(model, dict):
-        # Ensemble prediction
         w_xgb   = model['weights']['xgb']
         w_ridge = model['weights']['ridge']
-        return w_xgb * model['xgb'].predict(X) + w_ridge * model['ridge'].predict(X)
-    return model.predict(X)
+        raw_preds = w_xgb * model['xgb'].predict(X) + w_ridge * model['ridge'].predict(X)
+    else:
+        raw_preds = model.predict(X)
+
+    if rescale_to_return_space:
+        if 'EST_VOL_prev' not in df.columns:
+            raise ValueError("'EST_VOL_prev' required in df when rescale_to_return_space=True")
+        return raw_preds * df['EST_VOL_prev'].values
+    return raw_preds

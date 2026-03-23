@@ -1,16 +1,59 @@
 # MTH9899 Final Project — Next-Day Residual Return Prediction
 
-A machine learning pipeline to predict next-day residual stock returns at 15:30, trained on ~500 US equities over 2010–2014.
+A machine learning pipeline to predict next-day residual stock returns at 15:30, trained on ~1,258 US equities over 2010–2014.
 
-## Project Overview
+**Best model:** XGBoost (selected by liquidity-weighted R² on 2014 validation set)
 
-**Prediction task:** At 15:30 each trading day, predict the 24-hour ahead residual return for each stock in the universe.
+---
 
-**Target variable:** `Part A (15:30→16:00 same day) + Part B (open→15:30 next day)` residual returns, vol-scaled and normalized.
+## Deliverables
 
-**Train:** 2010–2013 (~1.26M rows) | **Validation:** 2014 (~315K rows)
+| Requirement | Location |
+|---|---|
+| **5.1 — Code and model** | `main.py` (CLI), `src/` (pipeline modules), `saved_model/` (artifacts) |
+| **5.2 — White paper** | `whitepaper/white_paper.pdf` |
+| **5.3 — Visualizations** | Appendix of `whitepaper/white_paper.pdf`; also `whitepaper/figures/` |
 
-**Best model:** XGBoost (selected by liquidity-weighted R² on validation set)
+---
+
+## Running the Model (Grader Instructions)
+
+The CLI entry point is `main.py`. Use **Mode 1** to generate features, then **Mode 2** to generate predictions.
+
+```bash
+# Mode 1: Build features from raw OOS data
+python3 main.py -m 1 -i oos_data -o /tmp/features -s 20150101 -e 20151231
+
+# Mode 2: Generate predictions from features
+python3 main.py -m 2 -i /tmp/features -o /tmp/preds -p saved_model -s 20150101 -e 20151231
+```
+
+**Mode 1** input (`-i`) must be the parent directory containing `daily_data/` and `intraday_data/` subdirectories (the holdout format). It also accepts the training-data naming convention (`DailyData/` + `data_intraday/`).
+
+**Mode 2** output CSVs have columns: `Date, Time, Id, Pred`. Predictions are in normalized `Target_model` space for R² evaluation.
+
+---
+
+## Saved Model Artifacts (`saved_model/`)
+
+| File | Contents |
+|---|---|
+| `best_model.pkl` | Fitted XGBoost model |
+| `feature_cols.pkl` | Ordered list of 16 feature names |
+| `scaler.pkl` | StandardScaler fitted on 2010–2013 train set only |
+| `fit_target_mode.pkl` | `'vol_scaled'` — target normalization mode |
+
+To apply the model programmatically:
+
+```python
+from src.predict import predict
+
+# df must contain the 16 feature columns (already normalized)
+preds = predict(df, model_dir='saved_model')
+
+# Use rescale_to_return_space=True to convert predictions back to return units
+preds_returns = predict(df, model_dir='saved_model', rescale_to_return_space=True)
+```
 
 ---
 
@@ -18,37 +61,42 @@ A machine learning pipeline to predict next-day residual stock returns at 15:30,
 
 ```
 MTH9899-Project/
+├── main.py                     # CLI entry point (Mode 1: features, Mode 2: predictions)
 ├── src/
-│   ├── data.py         # Data loading and date map utilities
-│   ├── target.py       # Target variable construction pipeline
-│   ├── features.py     # Feature engineering (intraday + daily)
-│   ├── train.py        # Model training and hyperparameter search
-│   ├── predict.py      # Inference with saved artifacts
-│   └── utils.py        # Shared utilities (weighted R², etc.)
+│   ├── data.py                 # Data loading and date map utilities
+│   ├── target.py               # Target variable construction pipeline
+│   ├── features.py             # Feature engineering (16 features: intraday + daily)
+│   ├── train.py                # Model training, walk-forward CV, ensemble, artifact saving
+│   ├── predict.py              # Inference with saved artifacts
+│   ├── utils.py                # Shared utilities (weighted R², z-score, winsorize, IC)
+│   └── visualization.py        # All plotting functions (IC, bin plots, drift, rolling corr)
 ├── tests/
-│   └── test_features.py
+│   ├── test_features.py
+│   └── test_mode1_completeness.py
 ├── saved_model/
-│   ├── best_model.pkl      # Fitted XGBoost model
-│   ├── feature_cols.pkl    # Ordered list of 13 feature names
-│   ├── scaler.pkl          # StandardScaler fitted on train set
-│   └── fit_target_mode.pkl # Target normalization mode ('vol_scaled')
-├── run.ipynb               # Orchestration notebook (full pipeline)
-├── Full_Pipeline.ipynb     # Legacy monolithic notebook
-├── requirements.txt
-└── CLAUDE.md
+│   ├── best_model.pkl          # Fitted XGBoost model
+│   ├── feature_cols.pkl        # Ordered list of 16 feature names
+│   ├── scaler.pkl              # StandardScaler (train-fit only)
+│   └── fit_target_mode.pkl     # 'vol_scaled'
+├── whitepaper/
+│   ├── white_paper.pdf         # Final written report (sections 5.2 + 5.3)
+│   ├── white_paper.md          # Source markdown
+│   └── figures/                # Standalone PNG exports of all plots
+├── run.ipynb                   # Full interactive pipeline notebook
+└── oos_data/                   # Held-out test data (2015)
+    ├── daily_data/
+    └── intraday_data/
 ```
 
 Data directories (gitignored):
 ```
-DailyData/          # dat.YYYYMMDD.csv — OHLCV + adjustment factors
-data_intraday/      # YYYYMMDD.csv — 15-min residual return snapshots
+DailyData/        # dat.YYYYMMDD.csv — OHLCV + adjustment factors (training)
+data_intraday/    # YYYYMMDD.csv — 15-min residual return snapshots (training)
 ```
 
 ---
 
 ## Setup
-
-This project runs in a Docker DevContainer with Python 3.
 
 ```bash
 pip install -r requirements.txt
@@ -56,36 +104,30 @@ pip install -r requirements.txt
 
 Required packages: `numpy pandas scikit-learn xgboost joblib scipy statsmodels matplotlib plotly tqdm python-dotenv pytest`
 
----
-
-## Running the Pipeline
-
-Open and run `run.ipynb` from the `MTH9899-Project/` directory. The notebook steps through:
-
-1. Load date maps and daily data
-2. Build the target variable
-3. Train/validation split (2010–2013 train, 2014 val)
-4. Build and normalize features
-5. Apply target normalization pipeline
-6. Train all five models with hyperparameter search
-7. Select and save the best model
-8. Feature importance (permutation MDA)
-9. Bin plots and white paper visualizations
-
-```bash
-jupyter notebook run.ipynb
-```
-
 Run tests:
+
 ```bash
 pytest
 ```
 
 ---
 
-## Features (13 total)
+## Prediction Task
 
-All features use only data available at or before 15:30 on the prediction day. Each feature goes through: per-Id time-series z-score (252-day rolling, past-only) → cross-sectional ±5 MAD winsorization → cross-sectional z-score.
+**At 15:30 each trading day**, predict the 24-hour ahead residual return for each stock:
+- **Part A:** Same-day 15:30→16:00 residual return
+- **Part B:** Next trading day open→15:30 residual return
+- `target = Part A + Part B`
+
+**Train:** 2010–2013 (~1.26M rows) | **Validation:** 2014 (~315K rows) | **Test:** 2015 (held out)
+
+**Sample weights:** `sqrt(MDV_63_prev)` for liquidity-weighted R² evaluation.
+
+---
+
+## Features (16 total)
+
+All features use only data available at or before 15:30. Normalization pipeline: per-Id time-series z-score (252-day rolling, past-only) → cross-sectional ±5 MAD winsorization → cross-sectional z-score.
 
 ### Intraday Features (from `data_intraday/`)
 
@@ -94,10 +136,12 @@ All features use only data available at or before 15:30 on the prediction day. E
 | `OvernightReturn` | `CumReturnResid` at 09:45 |
 | `FirstHourMomentum` | `CumReturnResid(12:00) − CumReturnResid(09:45)` |
 | `LastHourMomentum` | `CumReturnResid(15:30) − CumReturnResid(14:30)` |
-| `IntradayReversal` | Morning return − afternoon return |
+| `IntradayReversal` | Morning return − afternoon return (09:45→12:00 minus 12:00→15:30) |
 | `IntradayReturnSkew` | Skewness of 15-min residual return increments |
 | `RealizedUpsideVol` | RMS of positive 15-min increments |
-| `VolumeSurprise` | `CumVolume(15:30) / MDV_63_prev` |
+| `IntradayVol` | Std dev of 15-min return increments |
+| `IntradayVolAccel` | Ratio of afternoon vol to morning vol (split at 12:00) |
+| `VolumeSurprise` | `(CumVolume(15:30) × SharesAdjFactor_prev × Close_adj_prev) / MDV_63_prev` |
 | `VolumeMorningAfternoonRatio` | Morning volume / afternoon volume (split at 12:00) |
 | `RetVolCorr` | Pearson correlation of 15-min return and volume increments |
 
@@ -107,6 +151,7 @@ All features use only data available at or before 15:30 on the prediction day. E
 |---|---|
 | `VolatilityAdjustedReturn` | `CumReturnResid(15:30) / EST_VOL_prev` |
 | `ShortTermReversal` | `Close_adj(t−1) / Close_adj(t−2) − 1` |
+| `Momentum5d` | `Close_adj(t−2) / Close_adj(t−7) − 1` (skips t−1) |
 | `Momentum21d` | `Close_adj(t−2) / Close_adj(t−23) − 1` (skips t−1) |
 | `DollarVolTrend` | `mean(DollarVol t−1..t−5) / MDV_63_prev` |
 
@@ -114,56 +159,12 @@ All features use only data available at or before 15:30 on the prediction day. E
 
 ## Models
 
-Five models trained; best selected by validation liquidity-weighted R² (weights = `sqrt(MDV_63_prev)`):
+Five models trained; best selected by validation liquidity-weighted R²:
 
 | Model | Hyperparameter Search |
 |---|---|
+| **XGBoost** ✓ | max_depth ∈ {3–6}, lr ∈ {0.03,0.05,0.1}, n_estimators ∈ {100,200} |
 | Ridge | alpha ∈ logspace(−3, 3, 25) |
-| Random Forest | n_estimators ∈ {80,150}, max_depth ∈ {5,7,10}, min_samples_leaf ∈ {10,20} |
-| **XGBoost** ✓ | max_depth ∈ {3–6}, lr ∈ {0.03,0.05,0.1}, n_estimators ∈ {100,200,300} |
-| ElasticNet | alpha ∈ logspace(−5, −0.5, 12), l1_ratio ∈ {0.1,0.5,0.8,0.9,0.95,1.0} |
-| MLP | hidden layers ∈ {(64,),(128,),(128,64)}, alpha ∈ {1e-4,1e-3,1e-2}, lr ∈ {1e-3,2e-3} |
-
----
-
-## Inference
-
-```python
-from src.predict import predict
-import pandas as pd
-
-# df must contain the 13 feature columns (already normalized)
-preds = predict(df, model_dir='saved_model')
-```
-
-Or load artifacts manually:
-
-```python
-import pickle
-
-with open('saved_model/best_model.pkl', 'rb') as f:
-    model = pickle.load(f)
-with open('saved_model/feature_cols.pkl', 'rb') as f:
-    feature_cols = pickle.load(f)
-with open('saved_model/scaler.pkl', 'rb') as f:
-    scaler = pickle.load(f)
-
-X = scaler.transform(df[feature_cols].astype(float))
-preds = model.predict(X)
-```
-
----
-
-## Data Format
-
-### `DailyData/dat.YYYYMMDD.csv`
-`Date, ID, SYMBOL, MIC, FREE_FLOAT_PERCENTAGE, EST_VOL, MDV_63, Open, High, Low, Close, Volume, PxAdjFactor, SharesAdjFactor`
-
-- Adjusted close: `Close_adj = Close × PxAdjFactor`
-- `MDV_63`: 63-day median daily dollar volume
-- `EST_VOL`: annualized volatility estimate
-
-### `data_intraday/YYYYMMDD.csv`
-`Date, Time, Id, CumReturnResid, CumReturnRaw, CumVolume`
-
-- 15-minute snapshots from 09:45; key timestamps: 09:45, 12:00, 14:30, 15:30
+| Random Forest | max_depth ∈ {5,8}, min_samples_leaf ∈ {10,20}; 80 estimators |
+| ElasticNet | alpha ∈ 10^[−5..−0.5], l1_ratio ∈ {0.8,0.9,0.95,1.0} |
+| MLP | hidden layers, alpha, lr_init; 36 configs, early stopping |
